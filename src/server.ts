@@ -82,6 +82,14 @@ function trackIndexed(bytes: number): void {
   sessionStats.bytesIndexed += bytes;
 }
 
+/** Return a JSON-structured response for better UI rendering (OMP JSON tree view). */
+function jsonResponse(toolName: string, data: Record<string, unknown>, isError = false): ToolResult {
+  return trackResponse(toolName, {
+    content: [{ type: "text" as const, text: JSON.stringify(data) }],
+    ...(isError && { isError: true }),
+  });
+}
+
 // Build description dynamically based on detected runtimes
 const langList = available.join(", ");
 const bunNote = hasBunRuntime()
@@ -215,43 +223,16 @@ export function extractSnippet(
 server.registerTool(
   "execute",
   {
-    title: "Execute Code",
-    description: `Execute code in a sandboxed subprocess. Only stdout enters context — raw data stays in the subprocess. Use instead of bash/cat when output would exceed 20 lines.${bunNote} Available: ${langList}.\n\nPREFER THIS OVER BASH for: API calls (gh, curl, aws), test runners (npm test, pytest), git queries (git log, git diff), data processing, and ANY CLI command that may produce large output. Bash should only be used for file mutations, git writes, and navigation.`,
+    title: "Run Code",
+    description: `Execute code in a sandboxed subprocess. Only stdout enters context.${bunNote} Available: ${langList}. Prefer over Bash for commands with large output.`,
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     inputSchema: z.object({
       language: z
-        .enum([
-          "javascript",
-          "typescript",
-          "python",
-          "shell",
-          "ruby",
-          "go",
-          "rust",
-          "php",
-          "perl",
-          "r",
-          "elixir",
-        ])
+        .enum(["javascript", "typescript", "python", "shell", "ruby", "go", "rust", "php", "perl", "r", "elixir"])
         .describe("Runtime language"),
-      code: z
-        .string()
-        .describe(
-          "Source code to execute. Use console.log (JS/TS), print (Python/Ruby/Perl/R), echo (Shell), echo (PHP), fmt.Println (Go), or IO.puts (Elixir) to output a summary to context.",
-        ),
-      timeout: z
-        .number()
-        .optional()
-        .default(30000)
-        .describe("Max execution time in ms"),
-      intent: z
-        .string()
-        .optional()
-        .describe(
-          "What you're looking for in the output. When provided and output is large (>5KB), " +
-          "indexes output into knowledge base and returns section titles + previews — not full content. " +
-          "Use search(queries: [...]) to retrieve specific sections. Example: 'failing tests', 'HTTP 500 errors'." +
-          "\n\nTIP: Use specific technical terms, not just concepts. Check 'Searchable terms' in the response for available vocabulary.",
-        ),
+      code: z.string().describe("Source code to execute. Print output to stdout."),
+      timeout: z.number().optional().default(30000).describe("Max execution time in ms"),
+      intent: z.string().optional().describe("What you're looking for. Large output (>5KB) gets indexed; use search() to retrieve sections."),
     }),
   },
   async ({ language, code, timeout, intent }) => {
@@ -282,34 +263,25 @@ if(__cm_net>0)process.stderr.write('__CM_NET__:'+__cm_net+'\\n');
       }
 
       if (result.timedOut) {
-        return trackResponse("execute", {
-          content: [
-            {
-              type: "text" as const,
-              text: `Execution timed out after ${timeout}ms\n\nPartial stdout:\n${result.stdout}\n\nstderr:\n${result.stderr}`,
-            },
-          ],
-          isError: true,
-        });
+        return jsonResponse("execute", {
+          error: `Execution timed out after ${timeout}ms`,
+          language, output: result.stdout, stderr: result.stderr,
+        }, true);
       }
 
       if (result.exitCode !== 0) {
         const output = `Exit code: ${result.exitCode}\n\nstdout:\n${result.stdout}\n\nstderr:\n${result.stderr}`;
         if (intent && intent.trim().length > 0 && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
           trackIndexed(Buffer.byteLength(output));
-          return trackResponse("execute", {
-            content: [
-              { type: "text" as const, text: intentSearch(output, intent, `execute:${language}:error`) },
-            ],
-            isError: true,
-          });
+          return jsonResponse("execute", {
+            language, exit_code: result.exitCode, indexed: true,
+            ...parseIntentResult(intentSearch(output, intent, `execute:${language}:error`)),
+          }, true);
         }
-        return trackResponse("execute", {
-          content: [
-            { type: "text" as const, text: output },
-          ],
-          isError: true,
-        });
+        return jsonResponse("execute", {
+          language, exit_code: result.exitCode,
+          output: result.stdout, stderr: result.stderr,
+        }, true);
       }
 
       const stdout = result.stdout || "(no output)";
@@ -317,26 +289,18 @@ if(__cm_net>0)process.stderr.write('__CM_NET__:'+__cm_net+'\\n');
       // Intent-driven search: if intent provided and output is large enough
       if (intent && intent.trim().length > 0 && Buffer.byteLength(stdout) > INTENT_SEARCH_THRESHOLD) {
         trackIndexed(Buffer.byteLength(stdout));
-        return trackResponse("execute", {
-          content: [
-            { type: "text" as const, text: intentSearch(stdout, intent, `execute:${language}`) },
-          ],
+        return jsonResponse("execute", {
+          language, exit_code: 0, indexed: true,
+          ...parseIntentResult(intentSearch(stdout, intent, `execute:${language}`)),
         });
       }
 
-      return trackResponse("execute", {
-        content: [
-          { type: "text" as const, text: stdout },
-        ],
+      return jsonResponse("execute", {
+        language, exit_code: 0, output: stdout,
       });
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      return trackResponse("execute", {
-        content: [
-          { type: "text" as const, text: `Runtime error: ${message}` },
-        ],
-        isError: true,
-      });
+      return jsonResponse("execute", { error: message }, true);
     }
   },
 );
@@ -428,114 +392,81 @@ function intentSearch(
 // Tool: execute_file
 // ─────────────────────────────────────────────────────────
 
+/** Parse intentSearch text output into structured fields for JSON response. */
+function parseIntentResult(text: string): Record<string, unknown> {
+  const lines = text.split("\n");
+  const sections: string[] = [];
+  let searchable_terms: string[] = [];
+  let summary = "";
+
+  for (const line of lines) {
+    if (line.startsWith("Indexed ")) summary = line;
+    else if (line.startsWith("  - ")) sections.push(line.slice(4).trim());
+    else if (line.startsWith("Searchable terms: ")) {
+      searchable_terms = line.slice(18).split(", ").filter(Boolean);
+    }
+  }
+
+  return {
+    ...(summary && { summary }),
+    ...(sections.length > 0 && { sections }),
+    ...(searchable_terms.length > 0 && { searchable_terms }),
+  };
+}
+
 server.registerTool(
   "execute_file",
   {
-    title: "Execute File Processing",
-    description:
-      "Read a file and process it without loading contents into context. The file is read into a FILE_CONTENT variable inside the sandbox. Only your printed summary enters context.\n\nPREFER THIS OVER Read/cat for: log files, data files (CSV, JSON, XML), large source files for analysis, and any file where you need to extract specific information rather than read the entire content.",
+    title: "Process File",
+    description: "Read a file into FILE_CONTENT variable and process it in a sandbox. Only printed output enters context. Prefer over Read/cat for large files.",
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: z.object({
-      path: z
-        .string()
-        .describe("Absolute file path or relative to project root"),
+      path: z.string().describe("File path (absolute or relative)"),
       language: z
-        .enum([
-          "javascript",
-          "typescript",
-          "python",
-          "shell",
-          "ruby",
-          "go",
-          "rust",
-          "php",
-          "perl",
-          "r",
-          "elixir",
-        ])
+        .enum(["javascript", "typescript", "python", "shell", "ruby", "go", "rust", "php", "perl", "r", "elixir"])
         .describe("Runtime language"),
-      code: z
-        .string()
-        .describe(
-          "Code to process FILE_CONTENT (file_content in Elixir). Print summary via console.log/print/echo/IO.puts.",
-        ),
-      timeout: z
-        .number()
-        .optional()
-        .default(30000)
-        .describe("Max execution time in ms"),
-      intent: z
-        .string()
-        .optional()
-        .describe(
-          "What you're looking for in the output. When provided and output is large (>5KB), " +
-          "returns only matching sections via BM25 search instead of truncated output.",
-        ),
+      code: z.string().describe("Code to process FILE_CONTENT. Print summary to stdout."),
+      timeout: z.number().optional().default(30000).describe("Max execution time in ms"),
+      intent: z.string().optional().describe("What you're looking for. Large output gets indexed; use search() to retrieve."),
     }),
   },
   async ({ path, language, code, timeout, intent }) => {
     try {
-      const result = await executor.executeFile({
-        path,
-        language,
-        code,
-        timeout,
-      });
+      const result = await executor.executeFile({ path, language, code, timeout });
 
       if (result.timedOut) {
-        return trackResponse("execute_file", {
-          content: [
-            {
-              type: "text" as const,
-              text: `Timed out processing ${path} after ${timeout}ms`,
-            },
-          ],
-          isError: true,
-        });
+        return jsonResponse("execute_file", { error: `Timed out after ${timeout}ms`, path, language }, true);
       }
 
       if (result.exitCode !== 0) {
         const output = `Error processing ${path} (exit ${result.exitCode}):\n${result.stderr || result.stdout}`;
         if (intent && intent.trim().length > 0 && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
           trackIndexed(Buffer.byteLength(output));
-          return trackResponse("execute_file", {
-            content: [
-              { type: "text" as const, text: intentSearch(output, intent, `file:${path}:error`) },
-            ],
-            isError: true,
-          });
+          return jsonResponse("execute_file", {
+            path, language, exit_code: result.exitCode, indexed: true,
+            ...parseIntentResult(intentSearch(output, intent, `file:${path}:error`)),
+          }, true);
         }
-        return trackResponse("execute_file", {
-          content: [
-            { type: "text" as const, text: output },
-          ],
-          isError: true,
-        });
+        return jsonResponse("execute_file", {
+          path, language, exit_code: result.exitCode,
+          output: result.stdout, stderr: result.stderr,
+        }, true);
       }
 
       const stdout = result.stdout || "(no output)";
 
       if (intent && intent.trim().length > 0 && Buffer.byteLength(stdout) > INTENT_SEARCH_THRESHOLD) {
         trackIndexed(Buffer.byteLength(stdout));
-        return trackResponse("execute_file", {
-          content: [
-            { type: "text" as const, text: intentSearch(stdout, intent, `file:${path}`) },
-          ],
+        return jsonResponse("execute_file", {
+          path, language, exit_code: 0, indexed: true,
+          ...parseIntentResult(intentSearch(stdout, intent, `file:${path}`)),
         });
       }
 
-      return trackResponse("execute_file", {
-        content: [
-          { type: "text" as const, text: stdout },
-        ],
-      });
+      return jsonResponse("execute_file", { path, language, exit_code: 0, output: stdout });
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      return trackResponse("execute_file", {
-        content: [
-          { type: "text" as const, text: `Runtime error: ${message}` },
-        ],
-        isError: true,
-      });
+      return jsonResponse("execute_file", { error: message, path }, true);
     }
   },
 );
@@ -547,62 +478,22 @@ server.registerTool(
 server.registerTool(
   "index",
   {
-    title: "Index Content",
-    description:
-      "Index documentation or knowledge content into a searchable BM25 knowledge base. " +
-      "Chunks markdown by headings (keeping code blocks intact) and stores in ephemeral FTS5 database. " +
-      "The full content does NOT stay in context — only a brief summary is returned.\n\n" +
-      "WHEN TO USE:\n" +
-      "- Documentation from Context7, Skills, or MCP tools (API docs, framework guides, code examples)\n" +
-      "- API references (endpoint details, parameter specs, response schemas)\n" +
-      "- MCP tools/list output (exact tool signatures and descriptions)\n" +
-      "- Skill prompts and instructions that are too large for context\n" +
-      "- README files, migration guides, changelog entries\n" +
-      "- Any content with code examples you may need to reference precisely\n\n" +
-      "After indexing, use 'search' to retrieve specific sections on-demand.\n" +
-      "Do NOT use for: log files, test output, CSV, build output — use 'execute_file' for those.",
+    title: "Index",
+    description: "Index content into a searchable BM25 knowledge base. Chunks by headings, stores in FTS5. Use search() to query.",
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: z.object({
-      content: z
-        .string()
-        .optional()
-        .describe(
-          "Raw text/markdown to index. Provide this OR path, not both.",
-        ),
-      path: z
-        .string()
-        .optional()
-        .describe(
-          "File path to read and index (content never enters context). Provide this OR content.",
-        ),
-      source: z
-        .string()
-        .optional()
-        .describe(
-          "Label for the indexed content (e.g., 'Context7: React useEffect', 'Skill: frontend-design')",
-        ),
-      database: z
-        .string()
-        .optional()
-        .describe(
-          "Named persistent database. If provided, content is indexed into a file-backed DB that survives across sessions. Omit for ephemeral (session-only) storage.",
-        ),
+      content: z.string().optional().describe("Raw text/markdown to index. Provide this OR path."),
+      path: z.string().optional().describe("File path to index server-side. Provide this OR content."),
+      source: z.string().optional().describe("Label for the content (e.g., 'React docs')"),
+      database: z.string().optional().describe("Named persistent DB. Omit for ephemeral storage."),
     }),
   },
   async ({ content, path, source, database }) => {
     if (!content && !path) {
-      return trackResponse("index", {
-        content: [
-          {
-            type: "text" as const,
-            text: "Error: Either content or path must be provided",
-          },
-        ],
-        isError: true,
-      });
+      return jsonResponse("index", { error: "Either content or path must be provided" }, true);
     }
 
     try {
-      // Track the raw bytes being indexed (content or file)
       if (content) trackIndexed(Buffer.byteLength(content));
       else if (path) {
         try {
@@ -613,22 +504,11 @@ server.registerTool(
       const store = resolveStore(database);
       const result = store.index({ content, path, source });
 
-      return trackResponse("index", {
-        content: [
-          {
-            type: "text" as const,
-            text: `Indexed ${result.totalChunks} sections (${result.codeChunks} with code) from: ${result.label}\nUse search(queries: ["..."]) to query this content. Use source: "${result.label}" to scope results.`,
-          },
-        ],
+      return jsonResponse("index", {
+        source: result.label, chunks: result.totalChunks, code_chunks: result.codeChunks,
       });
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      return trackResponse("index", {
-        content: [
-          { type: "text" as const, text: `Index error: ${message}` },
-        ],
-        isError: true,
-      });
+      return jsonResponse("index", { error: err instanceof Error ? err.message : String(err) }, true);
     }
   },
 );
@@ -647,28 +527,14 @@ const SEARCH_BLOCK_AFTER = 8; // after 8 calls: refuse, demand batching
 server.registerTool(
   "search",
   {
-    title: "Search Indexed Content",
-    description:
-      "Search indexed content. Pass ALL search questions as queries array in ONE call.\n\n" +
-      "TIPS: 2-4 specific terms per query. Use 'source' to scope results.",
+    title: "Search",
+    description: "Search indexed content. Pass ALL queries as array in ONE call. 2-4 terms per query.",
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: z.object({
-      queries: z
-        .array(z.string())
-        .optional()
-        .describe("Array of search queries. Batch ALL questions in one call."),
-      limit: z
-        .number()
-        .optional()
-        .default(3)
-        .describe("Results per query (default: 3)"),
-      source: z
-        .string()
-        .optional()
-        .describe("Filter to a specific indexed source (partial match)."),
-      database: z
-        .string()
-        .optional()
-        .describe("Named persistent database to search. Omit to search the ephemeral session store."),
+      queries: z.array(z.string()).optional().describe("Search queries. Batch all in one call."),
+      limit: z.number().optional().default(3).describe("Results per query (default: 3)"),
+      source: z.string().optional().describe("Filter to source (partial match)."),
+      database: z.string().optional().describe("Named persistent DB. Omit for ephemeral."),
     }),
   },
   async (params) => {
@@ -685,10 +551,7 @@ server.registerTool(
       }
 
       if (queryList.length === 0) {
-        return trackResponse("search", {
-          content: [{ type: "text" as const, text: "Error: provide query or queries." }],
-          isError: true,
-        });
+        return jsonResponse("search", { error: "Provide query or queries." }, true);
       }
 
       const { limit = 3, source } = params as { limit?: number; source?: string };
@@ -703,15 +566,12 @@ server.registerTool(
 
       // After SEARCH_BLOCK_AFTER calls: refuse
       if (searchCallCount > SEARCH_BLOCK_AFTER) {
-        return trackResponse("search", {
-          content: [{
-            type: "text" as const,
-            text: `BLOCKED: ${searchCallCount} search calls in ${Math.round((now - searchWindowStart) / 1000)}s. ` +
-              "You're flooding context. STOP making individual search calls. " +
-              "Use batch_execute(commands, queries) for your next research step.",
-          }],
-          isError: true,
-        });
+        return jsonResponse("search", {
+          error: "Rate limited",
+          calls: searchCallCount,
+          window_seconds: Math.round((now - searchWindowStart) / 1000),
+          hint: "Use batch_execute(commands, queries) instead.",
+        }, true);
       }
 
       // Determine per-query result limit based on throttle level
@@ -760,11 +620,9 @@ server.registerTool(
 
       if (output.trim().length === 0) {
         const sources = store.listSources();
-        const sourceList = sources.length > 0
-          ? `\nIndexed sources: ${sources.map((s) => `"${s.label}" (${s.chunkCount} sections)`).join(", ")}`
-          : "";
-        return trackResponse("search", {
-          content: [{ type: "text" as const, text: `No results found.${sourceList}` }],
+        return jsonResponse("search", {
+          results: 0, queries: queryList,
+          ...(sources.length > 0 && { indexed_sources: sources.map(s => ({ label: s.label, chunks: s.chunkCount })) }),
         });
       }
 
@@ -772,11 +630,7 @@ server.registerTool(
         content: [{ type: "text" as const, text: output }],
       });
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      return trackResponse("search", {
-        content: [{ type: "text" as const, text: `Search error: ${message}` }],
-        isError: true,
-      });
+      return jsonResponse("search", { error: err instanceof Error ? err.message : String(err) }, true);
     }
   },
 );
@@ -856,19 +710,12 @@ main();
 server.registerTool(
   "fetch_and_index",
   {
-    title: "Fetch & Index URL",
-    description:
-      "Fetches URL content, converts HTML to markdown, indexes into searchable knowledge base, " +
-      "and returns a ~3KB preview. Full content stays in sandbox — use search() for deeper lookups.\n\n" +
-      "Better than WebFetch: preview is immediate, full content is searchable, raw HTML never enters context.",
+    title: "Fetch URL",
+    description: "Fetch URL, convert HTML to markdown, index into knowledge base. Returns ~3KB preview. Use search() for full content.",
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     inputSchema: z.object({
-      url: z.string().describe("The URL to fetch and index"),
-      source: z
-        .string()
-        .optional()
-        .describe(
-          "Label for the indexed content (e.g., 'React useEffect docs', 'Supabase Auth API')",
-        ),
+      url: z.string().describe("URL to fetch"),
+      source: z.string().optional().describe("Label for the content (e.g., 'React docs')"),
     }),
   },
   async ({ url, source }) => {
@@ -882,27 +729,11 @@ server.registerTool(
       });
 
       if (result.exitCode !== 0) {
-        return trackResponse("fetch_and_index", {
-          content: [
-            {
-              type: "text" as const,
-              text: `Failed to fetch ${url}: ${result.stderr || result.stdout}`,
-            },
-          ],
-          isError: true,
-        });
+        return jsonResponse("fetch_and_index", { error: `Failed to fetch ${url}`, detail: result.stderr || result.stdout }, true);
       }
 
       if (!result.stdout || result.stdout.trim().length === 0) {
-        return trackResponse("fetch_and_index", {
-          content: [
-            {
-              type: "text" as const,
-              text: `Fetched ${url} but got empty content after HTML conversion`,
-            },
-          ],
-          isError: true,
-        });
+        return jsonResponse("fetch_and_index", { error: "Empty content after HTML conversion", url }, true);
       }
 
       // Index the markdown into FTS5
@@ -916,28 +747,14 @@ server.registerTool(
       const preview = markdown.length > PREVIEW_LIMIT
         ? markdown.slice(0, PREVIEW_LIMIT) + "\n\n…[truncated — use search() for full content]"
         : markdown;
-      const totalKB = (Buffer.byteLength(markdown) / 1024).toFixed(1);
 
-      const text = [
-        `Fetched and indexed **${indexed.totalChunks} sections** (${totalKB}KB) from: ${indexed.label}`,
-        `Full content indexed in sandbox — use search(queries: [...], source: "${indexed.label}") for specific lookups.`,
-        "",
-        "---",
-        "",
+      return jsonResponse("fetch_and_index", {
+        url, source: indexed.label, chunks: indexed.totalChunks,
+        size_kb: +(Buffer.byteLength(markdown) / 1024).toFixed(1),
         preview,
-      ].join("\n");
-
-      return trackResponse("fetch_and_index", {
-        content: [{ type: "text" as const, text }],
       });
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      return trackResponse("fetch_and_index", {
-        content: [
-          { type: "text" as const, text: `Fetch error: ${message}` },
-        ],
-        isError: true,
-      });
+      return jsonResponse("fetch_and_index", { error: err instanceof Error ? err.message : String(err) }, true);
     }
   },
 );
@@ -949,48 +766,17 @@ server.registerTool(
 server.registerTool(
   "batch_execute",
   {
-    title: "Batch Execute & Search",
-    description:
-      "Execute multiple commands in ONE call, auto-index all output, and search with multiple queries. " +
-      "Returns search results directly — no follow-up calls needed.\n\n" +
-      "THIS IS THE PRIMARY TOOL. Use this instead of multiple execute() calls.\n\n" +
-      "One batch_execute call replaces 30+ execute calls + 10+ search calls.\n" +
-      "Provide all commands to run and all queries to search — everything happens in one round trip.",
+    title: "Batch Run",
+    description: "Execute multiple commands in ONE call, auto-index output, search with queries. Returns results directly — no follow-up needed.",
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     inputSchema: z.object({
-      commands: z
-        .array(
-          z.object({
-            label: z
-              .string()
-              .describe(
-                "Section header for this command's output (e.g., 'README', 'Package.json', 'Source Tree')",
-              ),
-            command: z
-              .string()
-              .describe("Shell command to execute"),
-          }),
-        )
-        .min(1)
-        .describe(
-          "Commands to execute as a batch. Each runs sequentially, output is labeled with the section header.",
-        ),
-      queries: z
-        .array(z.string())
-        .min(1)
-        .describe(
-          "Search queries to extract information from indexed output. Use 5-8 comprehensive queries. " +
-          "Each returns top 5 matching sections with full content. " +
-          "This is your ONLY chance — put ALL your questions here. No follow-up calls needed.",
-        ),
-      timeout: z
-        .number()
-        .optional()
-        .default(60000)
-        .describe("Max execution time in ms (default: 60s)"),
-      database: z
-        .string()
-        .optional()
-        .describe("Named persistent database. If provided, batch output is indexed into a file-backed DB that survives across sessions."),
+      commands: z.array(z.object({
+        label: z.string().describe("Section header for output"),
+        command: z.string().describe("Shell command to execute"),
+      })).min(1).describe("Commands to run sequentially."),
+      queries: z.array(z.string()).min(1).describe("Search queries for indexed output. Put ALL questions here."),
+      timeout: z.number().optional().default(60000).describe("Max execution time in ms (default: 60s)"),
+      database: z.string().optional().describe("Named persistent DB. Omit for ephemeral."),
     }),
   },
   async ({ commands, queries, timeout, database }) => {
@@ -1010,15 +796,10 @@ server.registerTool(
       });
 
       if (result.timedOut) {
-        return trackResponse("batch_execute", {
-          content: [
-            {
-              type: "text" as const,
-              text: `Batch timed out after ${timeout}ms. Partial output:\n${result.stdout?.slice(0, 2000) || "(none)"}`,
-            },
-          ],
-          isError: true,
-        });
+        return jsonResponse("batch_execute", {
+          error: `Timed out after ${timeout}ms`,
+          partial_output: result.stdout?.slice(0, 2000) || "(none)",
+        }, true);
       }
 
       const stdout = result.stdout || "(no output)";
@@ -1103,16 +884,7 @@ server.registerTool(
         content: [{ type: "text" as const, text: output }],
       });
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      return trackResponse("batch_execute", {
-        content: [
-          {
-            type: "text" as const,
-            text: `Batch execution error: ${message}`,
-          },
-        ],
-        isError: true,
-      });
+      return jsonResponse("batch_execute", { error: err instanceof Error ? err.message : String(err) }, true);
     }
   },
 );
@@ -1124,33 +896,21 @@ server.registerTool(
 server.registerTool(
   "list_databases",
   {
-    title: "List Persistent Databases",
-    description:
-      "List available persistent knowledge bases. Returns names and sizes of file-backed FTS5 databases that survive across sessions.",
+    title: "List KBs",
+    description: "List persistent knowledge bases with names and sizes.",
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: z.object({}),
   },
   async () => {
     try {
       const dbs = ContentStore.listPersistent();
-      if (dbs.length === 0) {
-        return trackResponse("list_databases", {
-          content: [{ type: "text" as const, text: "No persistent databases found. Use index(..., database: \"name\") to create one." }],
-        });
-      }
-      const lines = ["## Persistent Knowledge Bases\n", "| Name | Size |", "|------|------|"];
-      for (const db of dbs) {
-        const size = db.sizeBytes < 1024 ? `${db.sizeBytes}B` : db.sizeBytes < 1048576 ? `${(db.sizeBytes / 1024).toFixed(1)}KB` : `${(db.sizeBytes / 1048576).toFixed(1)}MB`;
-        lines.push(`| ${db.name} | ${size} |`);
-      }
-      lines.push(`\nPath: ${ContentStore.persistentDir}`);
-      return trackResponse("list_databases", {
-        content: [{ type: "text" as const, text: lines.join("\n") }],
+      const kb = (b: number) => b < 1024 ? `${b}B` : b < 1048576 ? `${(b / 1024).toFixed(1)}KB` : `${(b / 1048576).toFixed(1)}MB`;
+      return jsonResponse("list_databases", {
+        databases: dbs.map(db => ({ name: db.name, size: kb(db.sizeBytes) })),
+        path: ContentStore.persistentDir,
       });
     } catch (err: unknown) {
-      return trackResponse("list_databases", {
-        content: [{ type: "text" as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
-        isError: true,
-      });
+      return jsonResponse("list_databases", { error: err instanceof Error ? err.message : String(err) }, true);
     }
   },
 );
@@ -1162,29 +922,24 @@ server.registerTool(
 server.registerTool(
   "delete_database",
   {
-    title: "Delete Persistent Database",
-    description: "Delete a named persistent knowledge base and its WAL/SHM files.",
+    title: "Delete KB",
+    description: "Delete a named persistent knowledge base.",
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     inputSchema: z.object({
-      name: z.string().describe("Name of the persistent database to delete."),
+      name: z.string().describe("Database name to delete"),
     }),
   },
   async ({ name }) => {
     try {
-      // Close cached connection if open
       const cached = _namedStores.get(name);
       if (cached) {
         cached.cleanup();
         _namedStores.delete(name);
       }
       const deleted = ContentStore.deletePersistent(name);
-      return trackResponse("delete_database", {
-        content: [{ type: "text" as const, text: deleted ? `Deleted persistent database: ${name}` : `Database not found: ${name}` }],
-      });
+      return jsonResponse("delete_database", { name, deleted });
     } catch (err: unknown) {
-      return trackResponse("delete_database", {
-        content: [{ type: "text" as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
-        isError: true,
-      });
+      return jsonResponse("delete_database", { error: err instanceof Error ? err.message : String(err) }, true);
     }
   },
 );
@@ -1249,22 +1004,20 @@ function roleForPid(pid: number): string {
 server.registerTool(
   "list_peers",
   {
-    title: "List Peer Agent Knowledge",
-    description:
-      "Discover other running context-mode agents and what they've indexed. Returns PID, source labels, and chunk counts for each peer's ephemeral database. Use before search_peers to see what's available.",
+    title: "List Peers",
+    description: "Discover other running context-mode agents and their indexed knowledge. Use before search_peers.",
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: z.object({}),
   },
   async () => {
     try {
       const peers = discoverPeerDbs();
       if (peers.length === 0) {
-        return trackResponse("list_peers", {
-          content: [{ type: "text" as const, text: "No peer context-mode agents found." }],
-        });
+        return jsonResponse("list_peers", { peers: [] });
       }
 
       const Database = loadDatabase();
-      const lines: string[] = ["## Peer Agent Knowledge\n"];
+      const peerList: Array<Record<string, unknown>> = [];
 
       for (const dbPath of peers) {
         const pid = pidFromDbPath(dbPath);
@@ -1277,26 +1030,16 @@ server.registerTool(
           db.close();
 
           const totalChunks = sources.reduce((s, r) => s + r.chunk_count, 0);
-          const role = roleForPid(pid);
-          lines.push(`### ${role} — PID ${pid} (${totalChunks} chunks)`);
-          for (const src of sources.slice(0, 10)) {
-            lines.push(`- ${src.label} (${src.chunk_count} chunks)`);
-          }
-          if (sources.length > 10) lines.push(`- ... and ${sources.length - 10} more sources`);
-          lines.push("");
-        } catch {
-          // DB may have been cleaned up between discovery and open
-        }
+          peerList.push({
+            role: roleForPid(pid), pid, chunks: totalChunks,
+            sources: sources.slice(0, 10).map(s => `${s.label} (${s.chunk_count})`),
+          });
+        } catch { /* DB cleaned up */ }
       }
 
-      return trackResponse("list_peers", {
-        content: [{ type: "text" as const, text: lines.join("\n") }],
-      });
+      return jsonResponse("list_peers", { peers: peerList });
     } catch (err: unknown) {
-      return trackResponse("list_peers", {
-        content: [{ type: "text" as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
-        isError: true,
-      });
+      return jsonResponse("list_peers", { error: err instanceof Error ? err.message : String(err) }, true);
     }
   },
 );
@@ -1308,22 +1051,20 @@ server.registerTool(
 server.registerTool(
   "search_peers",
   {
-    title: "Search Peer Agent Knowledge",
-    description:
-      "Search other running context-mode agents' indexed knowledge. Read-only — queries their ephemeral FTS5 databases without modifying them. Use list_peers first to see what's available.",
+    title: "Search Peers",
+    description: "Search other agents' indexed knowledge. Read-only. Use list_peers first.",
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: z.object({
-      queries: z.array(z.string()).min(1).describe("Search queries (2-4 terms each). All queries run in one call."),
-      source: z.string().optional().describe("Filter to sources matching this substring."),
-      limit: z.number().optional().default(5).describe("Max results per query (default 5)."),
+      queries: z.array(z.string()).min(1).describe("Search queries (2-4 terms each)."),
+      source: z.string().optional().describe("Filter by source substring."),
+      limit: z.number().optional().default(5).describe("Max results per query (default 5)"),
     }),
   },
   async ({ queries, source, limit }) => {
     try {
       const peers = discoverPeerDbs();
       if (peers.length === 0) {
-        return trackResponse("search_peers", {
-          content: [{ type: "text" as const, text: "No peer context-mode agents found." }],
-        });
+        return jsonResponse("search_peers", { results: [], peers: 0 });
       }
 
       const Database = loadDatabase();
@@ -1383,9 +1124,7 @@ server.registerTool(
       }
 
       if (allResults.length === 0) {
-        return trackResponse("search_peers", {
-          content: [{ type: "text" as const, text: "No results found across peer agents." }],
-        });
+        return jsonResponse("search_peers", { results: [], queries });
       }
 
       // Sort by BM25 rank (lower = better), deduplicate by content, limit total
@@ -1400,22 +1139,16 @@ server.registerTool(
         })
         .slice(0, limit * queries.length);
 
-      const lines: string[] = [];
-      for (const r of unique) {
-        lines.push(`## ${r.title}`);
-        lines.push(`*Source: ${r.source} — from ${r.peer_role} (PID ${r.peer_pid})*\n`);
-        lines.push(r.content.slice(0, 1500));
-        lines.push("");
-      }
-
-      return trackResponse("search_peers", {
-        content: [{ type: "text" as const, text: lines.join("\n") }],
+      return jsonResponse("search_peers", {
+        results: unique.map(r => ({
+          title: r.title, source: r.source,
+          from: r.peer_role, pid: r.peer_pid,
+          preview: r.content.slice(0, 1500),
+        })),
+        queries,
       });
     } catch (err: unknown) {
-      return trackResponse("search_peers", {
-        content: [{ type: "text" as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
-        isError: true,
-      });
+      return jsonResponse("search_peers", { error: err instanceof Error ? err.message : String(err) }, true);
     }
   },
 );
@@ -1427,87 +1160,41 @@ server.registerTool(
 server.registerTool(
   "stats",
   {
-    title: "Session Statistics",
-    description:
-      "Returns context consumption statistics for the current session. " +
-      "Shows total bytes returned to context, breakdown by tool, call counts, " +
-      "estimated token usage, and context savings ratio.",
+    title: "Stats",
+    description: "Context consumption statistics for the current session.",
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: z.object({}),
   },
   async () => {
-    const totalBytesReturned = Object.values(sessionStats.bytesReturned).reduce(
-      (sum, b) => sum + b,
-      0,
-    );
-    const totalCalls = Object.values(sessionStats.calls).reduce(
-      (sum, c) => sum + c,
-      0,
-    );
+    const totalBytesReturned = Object.values(sessionStats.bytesReturned).reduce((sum, b) => sum + b, 0);
+    const totalCalls = Object.values(sessionStats.calls).reduce((sum, c) => sum + c, 0);
     const uptimeMs = Date.now() - sessionStats.sessionStart;
-    const uptimeMin = (uptimeMs / 60_000).toFixed(1);
-
-    // Total data kept out of context = indexed (FTS5) + sandboxed (network I/O inside sandbox)
     const keptOut = sessionStats.bytesIndexed + sessionStats.bytesSandboxed;
     const totalProcessed = keptOut + totalBytesReturned;
-    const savingsRatio = totalProcessed / Math.max(totalBytesReturned, 1);
     const reductionPct = totalProcessed > 0
-      ? ((1 - totalBytesReturned / totalProcessed) * 100).toFixed(0)
-      : "0";
+      ? +((1 - totalBytesReturned / totalProcessed) * 100).toFixed(0)
+      : 0;
 
-    const kb = (b: number) => {
-      if (b >= 1024 * 1024) return `${(b / 1024 / 1024).toFixed(1)}MB`;
-      return `${(b / 1024).toFixed(1)}KB`;
-    };
+    const fmtKb = (b: number) => b >= 1024 * 1024 ? `${(b / 1024 / 1024).toFixed(1)}MB` : `${(b / 1024).toFixed(1)}KB`;
 
-    // ── Summary table ──
-    const lines: string[] = [
-      `## context-mode session stats`,
-      "",
-      `| Metric | Value |`,
-      `|--------|------:|`,
-      `| Session | ${uptimeMin} min |`,
-      `| Tool calls | ${totalCalls} |`,
-      `| Total data processed | **${kb(totalProcessed)}** |`,
-      `| Kept in sandbox | **${kb(keptOut)}** |`,
-      `| Entered context | ${kb(totalBytesReturned)} |`,
-      `| Tokens consumed | ~${Math.round(totalBytesReturned / 4).toLocaleString()} |`,
-      `| **Context savings** | **${savingsRatio.toFixed(1)}x (${reductionPct}% reduction)** |`,
-    ];
-
-    // ── Per-tool table ──
-    const toolNames = new Set([
-      ...Object.keys(sessionStats.calls),
-      ...Object.keys(sessionStats.bytesReturned),
-    ]);
-
-    if (toolNames.size > 0) {
-      lines.push(
-        "",
-        `| Tool | Calls | Context | Tokens |`,
-        `|------|------:|--------:|-------:|`,
-      );
-      for (const tool of Array.from(toolNames).sort()) {
-        const calls = sessionStats.calls[tool] || 0;
-        const bytes = sessionStats.bytesReturned[tool] || 0;
-        const tokens = Math.round(bytes / 4);
-        lines.push(`| ${tool} | ${calls} | ${kb(bytes)} | ~${tokens.toLocaleString()} |`);
-      }
-      lines.push(`| **Total** | **${totalCalls}** | **${kb(totalBytesReturned)}** | **~${Math.round(totalBytesReturned / 4).toLocaleString()}** |`);
+    const toolBreakdown: Record<string, { calls: number; context: string; tokens: number }> = {};
+    const toolNames = new Set([...Object.keys(sessionStats.calls), ...Object.keys(sessionStats.bytesReturned)]);
+    for (const tool of Array.from(toolNames).sort()) {
+      const calls = sessionStats.calls[tool] || 0;
+      const bytes = sessionStats.bytesReturned[tool] || 0;
+      toolBreakdown[tool] = { calls, context: fmtKb(bytes), tokens: Math.round(bytes / 4) };
     }
 
-    // ── DevRel summary ──
-    const tokensSaved = Math.round(keptOut / 4);
-    if (totalCalls === 0) {
-      lines.push("", "> No context-mode calls this session. Use `batch_execute` to run commands, `fetch_and_index` for URLs, or `execute` to process data in sandbox.");
-    } else if (keptOut === 0) {
-      lines.push("", `> context-mode handled **${totalCalls}** tool calls. All outputs were compact enough to enter context directly. Process larger data or batch multiple commands for bigger savings.`);
-    } else {
-      lines.push("", `> Without context-mode, **${kb(totalProcessed)}** of raw tool output would flood your context window. Instead, **${kb(keptOut)}** (${reductionPct}%) stayed in sandbox — saving **~${tokensSaved.toLocaleString()} tokens** of context space.`);
-    }
-
-    const text = lines.join("\n");
-    return trackResponse("stats", {
-      content: [{ type: "text" as const, text }],
+    return jsonResponse("stats", {
+      session_minutes: +(uptimeMs / 60_000).toFixed(1),
+      total_calls: totalCalls,
+      data_processed: fmtKb(totalProcessed),
+      kept_in_sandbox: fmtKb(keptOut),
+      entered_context: fmtKb(totalBytesReturned),
+      tokens_consumed: Math.round(totalBytesReturned / 4),
+      tokens_saved: Math.round(keptOut / 4),
+      context_savings: `${(totalProcessed / Math.max(totalBytesReturned, 1)).toFixed(1)}x (${reductionPct}% reduction)`,
+      tools: toolBreakdown,
     });
   },
 );
