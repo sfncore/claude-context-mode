@@ -19,7 +19,7 @@ import { join, basename } from "node:path";
 // This lets the MCP server start instantly even if the native module
 // isn't installed yet (marketplace first-run scenario).
 let _Database: typeof DatabaseConstructor | null = null;
-function loadDatabase(): typeof DatabaseConstructor {
+export function loadDatabase(): typeof DatabaseConstructor {
   if (!_Database) {
     const require = createRequire(import.meta.url);
     _Database = require("better-sqlite3") as typeof DatabaseConstructor;
@@ -177,6 +177,7 @@ export class ContentStore {
     this.#db = new Database(this.#dbPath, { timeout: 5000 });
     this.#db.pragma("journal_mode = WAL");
     this.#db.pragma("synchronous = NORMAL");
+    this.#db.pragma("busy_timeout = 5000");
     this.#initSchema();
   }
 

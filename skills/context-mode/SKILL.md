@@ -149,6 +149,7 @@ Use context-mode for ANY of these, without being asked:
 6. **Never use `index(content: large_data)`.** Use `index(path: ...)` to read files server-side. The `content` parameter sends data through context as a tool parameter — use it only for small inline text.
 7. **Always use `filename` parameter** on Playwright tools (`browser_snapshot`, `browser_console_messages`, `browser_network_requests`). Without it, the full output enters context.
 8. **Don't re-index data already in context.** If an MCP tool returned data in a previous response, it's already loaded — use it directly or save to file first.
+9. **Don't search stale indexes for monitoring decisions.** Always re-run the command fresh — indexed data is a past snapshot.
 
 ## Examples
 
@@ -271,6 +272,34 @@ Subagents automatically receive context-mode tool routing via a PreToolUse hook.
 - Passing ANY large data to `index(content: ...)` → data enters context as a parameter. **Always** use `index(path: ...)` to read server-side. The `content` parameter should only be used for small inline text you're composing yourself.
 - Calling an MCP tool (Context7 `query-docs`, GitHub API, etc.) then passing the response to `index(content: response)` → **doubles** context usage. The response is already in context — use it directly or save to file first.
 - Ignoring `browser_navigate` auto-snapshot → navigation response includes a full page snapshot. Don't rely on it for inspection — call `browser_snapshot(filename)` separately.
+
+## Cross-Agent Knowledge Sharing
+
+Other running context-mode agents index knowledge into ephemeral FTS5 databases. You can discover and search their knowledge **read-only** — no writes, no side effects.
+
+| Tool | Purpose |
+|------|---------|
+| `list_peers()` | See what other agents have indexed (PID, sources, chunk counts) |
+| `search_peers(queries, source?, limit?)` | Search across all peer agents' indexed knowledge |
+
+### When to use
+- Another agent already researched something you need ("what did the refinery find about X?")
+- Looking for docs or analysis indexed in a parallel session
+- Checking if someone already indexed an API reference before re-fetching
+
+### Example
+```
+list_peers()  →  PID 28785: "batch:Hook Status,Polecat List" (22 chunks)
+                 PID 86848: "OMP MCP Loading System Analysis" (452 chunks)
+
+search_peers(queries: ["hook discovery mechanism"])
+  →  Results from PID 86848's indexed analysis
+```
+
+### Notes
+- Read-only: peers' databases are never modified
+- Ephemeral: when an agent exits, its knowledge disappears
+- Use `list_peers` first to check if relevant knowledge exists before searching
 
 ## Reference Files
 

@@ -25,9 +25,16 @@
   "bin": {
     "context-mode": "./build/server.js"
   },
+  "omp": {
+    "name": "context-mode",
+    "version": "0.9.16",
+    "description": "Context-saving MCP tools — sandboxed execution, FTS5 knowledge base, intent-driven search",
+    "hooks": ".omp/hooks/context-mode-routing.ts"
+  },
   "files": [
     "build",
     "hooks",
+    ".omp",
     "server.bundle.mjs",
     "skills",
     ".claude-plugin",

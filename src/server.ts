@@ -3,7 +3,10 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { PolyglotExecutor } from "./executor.js";
-import { ContentStore, cleanupStaleDBs, type SearchResult } from "./store.js";
+import { ContentStore, cleanupStaleDBs, loadDatabase, type SearchResult } from "./store.js";
+import { readdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   detectRuntimes,
   getRuntimeSummary,
@@ -1179,6 +1182,198 @@ server.registerTool(
       });
     } catch (err: unknown) {
       return trackResponse("delete_database", {
+        content: [{ type: "text" as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      });
+    }
+  },
+);
+
+// ─────────────────────────────────────────────────────────
+// Tool: list_peers
+// ─────────────────────────────────────────────────────────
+
+/** Discover peer context-mode DBs in /tmp/. Returns paths excluding own PID. */
+function discoverPeerDbs(): string[] {
+  const ownFile = `context-mode-${process.pid}.db`;
+  try {
+    return readdirSync(tmpdir())
+      .filter(f => f.startsWith("context-mode-") && f.endsWith(".db")
+        && !f.endsWith("-wal") && !f.endsWith("-shm") && f !== ownFile)
+      .map(f => join(tmpdir(), f));
+  } catch { return []; }
+}
+
+/** Extract PID from a context-mode DB filename. */
+function pidFromDbPath(dbPath: string): number {
+  const m = dbPath.match(/context-mode-(\d+)\.db$/);
+  return m ? Number(m[1]) : 0;
+}
+
+server.registerTool(
+  "list_peers",
+  {
+    title: "List Peer Agent Knowledge",
+    description:
+      "Discover other running context-mode agents and what they've indexed. Returns PID, source labels, and chunk counts for each peer's ephemeral database. Use before search_peers to see what's available.",
+    inputSchema: z.object({}),
+  },
+  async () => {
+    try {
+      const peers = discoverPeerDbs();
+      if (peers.length === 0) {
+        return trackResponse("list_peers", {
+          content: [{ type: "text" as const, text: "No peer context-mode agents found." }],
+        });
+      }
+
+      const Database = loadDatabase();
+      const lines: string[] = ["## Peer Agent Knowledge\n"];
+
+      for (const dbPath of peers) {
+        const pid = pidFromDbPath(dbPath);
+        try {
+          const db = new Database(dbPath, { readonly: true, timeout: 1000 });
+          db.pragma("journal_mode = WAL");
+          const sources = db.prepare(
+            "SELECT label, chunk_count FROM sources ORDER BY id DESC"
+          ).all() as Array<{ label: string; chunk_count: number }>;
+          db.close();
+
+          const totalChunks = sources.reduce((s, r) => s + r.chunk_count, 0);
+          lines.push(`### PID ${pid} (${totalChunks} chunks)`);
+          for (const src of sources.slice(0, 10)) {
+            lines.push(`- ${src.label} (${src.chunk_count} chunks)`);
+          }
+          if (sources.length > 10) lines.push(`- ... and ${sources.length - 10} more sources`);
+          lines.push("");
+        } catch {
+          // DB may have been cleaned up between discovery and open
+        }
+      }
+
+      return trackResponse("list_peers", {
+        content: [{ type: "text" as const, text: lines.join("\n") }],
+      });
+    } catch (err: unknown) {
+      return trackResponse("list_peers", {
+        content: [{ type: "text" as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      });
+    }
+  },
+);
+
+// ─────────────────────────────────────────────────────────
+// Tool: search_peers
+// ─────────────────────────────────────────────────────────
+
+server.registerTool(
+  "search_peers",
+  {
+    title: "Search Peer Agent Knowledge",
+    description:
+      "Search other running context-mode agents' indexed knowledge. Read-only — queries their ephemeral FTS5 databases without modifying them. Use list_peers first to see what's available.",
+    inputSchema: z.object({
+      queries: z.array(z.string()).min(1).describe("Search queries (2-4 terms each). All queries run in one call."),
+      source: z.string().optional().describe("Filter to sources matching this substring."),
+      limit: z.number().optional().default(5).describe("Max results per query (default 5)."),
+    }),
+  },
+  async ({ queries, source, limit }) => {
+    try {
+      const peers = discoverPeerDbs();
+      if (peers.length === 0) {
+        return trackResponse("search_peers", {
+          content: [{ type: "text" as const, text: "No peer context-mode agents found." }],
+        });
+      }
+
+      const Database = loadDatabase();
+      const allResults: Array<{ title: string; content: string; source: string; rank: number; peer_pid: number }> = [];
+
+      for (const dbPath of peers) {
+        const pid = pidFromDbPath(dbPath);
+        let db;
+        try {
+          db = new Database(dbPath, { readonly: true, timeout: 1000 });
+          db.pragma("journal_mode = WAL");
+
+          const sourceFilter = source ? "AND sources.label LIKE ?" : "";
+          const stmt = db.prepare(`
+            SELECT
+              chunks.title,
+              chunks.content,
+              sources.label,
+              bm25(chunks, 2.0, 1.0) AS rank
+            FROM chunks
+            JOIN sources ON sources.id = chunks.source_id
+            WHERE chunks MATCH ? ${sourceFilter}
+            ORDER BY rank
+            LIMIT ?
+          `);
+
+          for (const query of queries) {
+            // Sanitize: remove FTS5 special chars
+            const sanitized = query.replace(/[*"():^~{}<>]/g, " ").trim();
+            if (!sanitized) continue;
+            try {
+              const params = source
+                ? [sanitized, `%${source}%`, limit]
+                : [sanitized, limit];
+              const rows = stmt.all(...params) as Array<{
+                title: string; content: string; label: string; rank: number;
+              }>;
+              for (const r of rows) {
+                allResults.push({
+                  title: r.title,
+                  content: r.content,
+                  source: r.label,
+                  rank: r.rank,
+                  peer_pid: pid,
+                });
+              }
+            } catch { /* query may fail on empty/corrupt DB — skip */ }
+          }
+
+          db.close();
+        } catch {
+          // DB unavailable — skip
+          try { db?.close(); } catch { /* ignore */ }
+        }
+      }
+
+      if (allResults.length === 0) {
+        return trackResponse("search_peers", {
+          content: [{ type: "text" as const, text: "No results found across peer agents." }],
+        });
+      }
+
+      // Sort by BM25 rank (lower = better), deduplicate by content, limit total
+      const seen = new Set<string>();
+      const unique = allResults
+        .sort((a, b) => a.rank - b.rank)
+        .filter(r => {
+          const key = r.content.slice(0, 200);
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        })
+        .slice(0, limit * queries.length);
+
+      const lines: string[] = [];
+      for (const r of unique) {
+        lines.push(`## ${r.title}`);
+        lines.push(`*Source: ${r.source} (peer ${r.peer_pid})*\n`);
+        lines.push(r.content.slice(0, 1500));
+        lines.push("");
+      }
+
+      return trackResponse("search_peers", {
+        content: [{ type: "text" as const, text: lines.join("\n") }],
+      });
+    } catch (err: unknown) {
+      return trackResponse("search_peers", {
         content: [{ type: "text" as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
         isError: true,
       });
