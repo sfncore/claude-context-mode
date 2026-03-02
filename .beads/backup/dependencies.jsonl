@@ -1,0 +1,12 @@
+{"created_at":"2026-03-02T14:36:11Z","created_by":"lora_forge/crew/forge","depends_on_id":"cm-2j5","issue_id":"cm-2j5.1","type":"parent-child"}
+{"created_at":"2026-03-02T14:36:26Z","created_by":"lora_forge/crew/forge","depends_on_id":"cm-2j5","issue_id":"cm-2j5.2","type":"parent-child"}
+{"created_at":"2026-03-02T14:36:26Z","created_by":"lora_forge/crew/forge","depends_on_id":"cm-2j5.1","issue_id":"cm-2j5.2","type":"blocks"}
+{"created_at":"2026-03-02T14:36:38Z","created_by":"lora_forge/crew/forge","depends_on_id":"cm-2j5","issue_id":"cm-2j5.3","type":"parent-child"}
+{"created_at":"2026-03-02T14:36:39Z","created_by":"lora_forge/crew/forge","depends_on_id":"cm-2j5.2","issue_id":"cm-2j5.3","type":"blocks"}
+{"created_at":"2026-03-02T14:39:28Z","created_by":"lora_forge/crew/forge","depends_on_id":"cm-2j5","issue_id":"cm-2j5.4","type":"parent-child"}
+{"created_at":"2026-03-02T14:40:09Z","created_by":"lora_forge/crew/forge","depends_on_id":"cm-2j5.3","issue_id":"cm-2j5.4","type":"blocks"}
+{"created_at":"2026-03-02T14:39:38Z","created_by":"lora_forge/crew/forge","depends_on_id":"cm-2j5","issue_id":"cm-2j5.5","type":"parent-child"}
+{"created_at":"2026-03-02T14:39:50Z","created_by":"lora_forge/crew/forge","depends_on_id":"cm-2j5","issue_id":"cm-2j5.6","type":"parent-child"}
+{"created_at":"2026-03-02T14:40:09Z","created_by":"lora_forge/crew/forge","depends_on_id":"cm-2j5.5","issue_id":"cm-2j5.6","type":"blocks"}
+{"created_at":"2026-03-02T14:40:01Z","created_by":"lora_forge/crew/forge","depends_on_id":"cm-2j5","issue_id":"cm-2j5.7","type":"parent-child"}
+{"created_at":"2026-03-02T14:40:09Z","created_by":"lora_forge/crew/forge","depends_on_id":"cm-2j5.5","issue_id":"cm-2j5.7","type":"blocks"}
