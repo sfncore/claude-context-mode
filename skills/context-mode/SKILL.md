@@ -279,8 +279,8 @@ Other running context-mode agents index knowledge into ephemeral FTS5 databases.
 
 | Tool | Purpose |
 |------|---------|
-| `list_peers()` | See what other agents have indexed (PID, sources, chunk counts) |
-| `search_peers(queries, source?, limit?)` | Search across all peer agents' indexed knowledge |
+| `list_peers()` | See what other agents have indexed (role, PID, sources, chunk counts) |
+| `search_peers(queries, source?, limit?)` | Search across all peer agents' indexed knowledge (results tagged with role) |
 
 ### When to use
 - Another agent already researched something you need ("what did the refinery find about X?")
@@ -289,11 +289,11 @@ Other running context-mode agents index knowledge into ephemeral FTS5 databases.
 
 ### Example
 ```
-list_peers()  →  PID 28785: "batch:Hook Status,Polecat List" (22 chunks)
-                 PID 86848: "OMP MCP Loading System Analysis" (452 chunks)
+list_peers()  →  witness (omp-qwen) — PID 28785: "batch:Hook Status,Polecat List" (22 chunks)
+                 mayor (claude) — PID 86848: "OMP MCP Loading System Analysis" (452 chunks)
 
 search_peers(queries: ["hook discovery mechanism"])
-  →  Results from PID 86848's indexed analysis
+  →  Results from mayor (PID 86848)'s indexed analysis
 ```
 
 ### Notes

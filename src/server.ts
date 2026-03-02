@@ -4,7 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { PolyglotExecutor } from "./executor.js";
 import { ContentStore, cleanupStaleDBs, loadDatabase, type SearchResult } from "./store.js";
-import { readdirSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -1210,6 +1210,42 @@ function pidFromDbPath(dbPath: string): number {
   return m ? Number(m[1]) : 0;
 }
 
+/** Resolve PID to a human-readable role label via /proc/{pid}/environ (Linux only). */
+function roleForPid(pid: number): string {
+  try {
+    const raw = readFileSync(`/proc/${pid}/environ`, "utf-8");
+    const env = Object.fromEntries(
+      raw.split("\0").filter(Boolean).map(e => {
+        const i = e.indexOf("=");
+        return i > 0 ? [e.slice(0, i), e.slice(i + 1)] : [e, ""];
+      }),
+    );
+    // GT_ROLE gives the full path like "sfgastown/polecats/jade" or "mayor"
+    const role = env.GT_ROLE;
+    const agent = env.GT_AGENT;
+    if (role) {
+      // Extract the meaningful part: "mayor", "polecat/jade", "refinery", "witness", "deacon", "crew/forge"
+      const parts = role.split("/");
+      // Patterns: "mayor", "deacon", "rig/refinery", "rig/witness", "rig/polecats/name", "rig/crew/name"
+      let label: string;
+      if (parts.includes("polecats")) {
+        const name = parts[parts.indexOf("polecats") + 1];
+        label = name ? `polecat/${name}` : "polecat";
+      } else if (parts.includes("crew")) {
+        const name = parts[parts.indexOf("crew") + 1];
+        label = name ? `crew/${name}` : "crew";
+      } else {
+        // Last meaningful segment: "mayor", "deacon", "refinery", "witness"
+        label = parts[parts.length - 1];
+      }
+      return agent ? `${label} (${agent})` : label;
+    }
+    return agent ? `unknown (${agent})` : `PID ${pid}`;
+  } catch {
+    return `PID ${pid}`;
+  }
+}
+
 server.registerTool(
   "list_peers",
   {
@@ -1241,7 +1277,8 @@ server.registerTool(
           db.close();
 
           const totalChunks = sources.reduce((s, r) => s + r.chunk_count, 0);
-          lines.push(`### PID ${pid} (${totalChunks} chunks)`);
+          const role = roleForPid(pid);
+          lines.push(`### ${role} — PID ${pid} (${totalChunks} chunks)`);
           for (const src of sources.slice(0, 10)) {
             lines.push(`- ${src.label} (${src.chunk_count} chunks)`);
           }
@@ -1290,10 +1327,11 @@ server.registerTool(
       }
 
       const Database = loadDatabase();
-      const allResults: Array<{ title: string; content: string; source: string; rank: number; peer_pid: number }> = [];
+      const allResults: Array<{ title: string; content: string; source: string; rank: number; peer_pid: number; peer_role: string }> = [];
 
       for (const dbPath of peers) {
         const pid = pidFromDbPath(dbPath);
+        const role = roleForPid(pid);
         let db;
         try {
           db = new Database(dbPath, { readonly: true, timeout: 1000 });
@@ -1331,6 +1369,7 @@ server.registerTool(
                   source: r.label,
                   rank: r.rank,
                   peer_pid: pid,
+                  peer_role: role,
                 });
               }
             } catch { /* query may fail on empty/corrupt DB — skip */ }
@@ -1364,7 +1403,7 @@ server.registerTool(
       const lines: string[] = [];
       for (const r of unique) {
         lines.push(`## ${r.title}`);
-        lines.push(`*Source: ${r.source} (peer ${r.peer_pid})*\n`);
+        lines.push(`*Source: ${r.source} — from ${r.peer_role} (PID ${r.peer_pid})*\n`);
         lines.push(r.content.slice(0, 1500));
         lines.push("");
       }
