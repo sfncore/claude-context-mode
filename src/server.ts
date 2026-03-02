@@ -31,6 +31,22 @@ function getStore(): ContentStore {
   return _store;
 }
 
+// Named persistent store cache
+const _namedStores = new Map<string, ContentStore>();
+function getNamedStore(name: string): ContentStore {
+  let store = _namedStores.get(name);
+  if (!store) {
+    store = ContentStore.openNamed(name);
+    _namedStores.set(name, store);
+  }
+  return store;
+}
+
+/** Get the ephemeral store or a named persistent store. */
+function resolveStore(database?: string): ContentStore {
+  return database ? getNamedStore(database) : getStore();
+}
+
 // ─────────────────────────────────────────────────────────
 // Session stats — track context consumption per tool
 // ─────────────────────────────────────────────────────────
@@ -561,9 +577,15 @@ server.registerTool(
         .describe(
           "Label for the indexed content (e.g., 'Context7: React useEffect', 'Skill: frontend-design')",
         ),
+      database: z
+        .string()
+        .optional()
+        .describe(
+          "Named persistent database. If provided, content is indexed into a file-backed DB that survives across sessions. Omit for ephemeral (session-only) storage.",
+        ),
     }),
   },
-  async ({ content, path, source }) => {
+  async ({ content, path, source, database }) => {
     if (!content && !path) {
       return trackResponse("index", {
         content: [
@@ -585,7 +607,7 @@ server.registerTool(
           trackIndexed(fs.readFileSync(path).byteLength);
         } catch { /* ignore — file read errors handled by store */ }
       }
-      const store = getStore();
+      const store = resolveStore(database);
       const result = store.index({ content, path, source });
 
       return trackResponse("index", {
@@ -640,12 +662,16 @@ server.registerTool(
         .string()
         .optional()
         .describe("Filter to a specific indexed source (partial match)."),
+      database: z
+        .string()
+        .optional()
+        .describe("Named persistent database to search. Omit to search the ephemeral session store."),
     }),
   },
   async (params) => {
     try {
-      const store = getStore();
       const raw = params as Record<string, unknown>;
+      const store = resolveStore(raw.database as string | undefined);
 
       // Normalize: accept both query (string) and queries (array)
       const queryList: string[] = [];
@@ -958,9 +984,13 @@ server.registerTool(
         .optional()
         .default(60000)
         .describe("Max execution time in ms (default: 60s)"),
+      database: z
+        .string()
+        .optional()
+        .describe("Named persistent database. If provided, batch output is indexed into a file-backed DB that survives across sessions."),
     }),
   },
-  async ({ commands, queries, timeout }) => {
+  async ({ commands, queries, timeout, database }) => {
     try {
       // Build batch script with markdown section headers for proper chunking
       const script = commands
@@ -996,7 +1026,7 @@ server.registerTool(
       trackIndexed(totalBytes);
 
       // Index into knowledge base — markdown heading chunking splits by # labels
-      const store = getStore();
+      const store = resolveStore(database);
       const source = `batch:${commands
         .map((c) => c.label)
         .join(",")
@@ -1078,6 +1108,78 @@ server.registerTool(
             text: `Batch execution error: ${message}`,
           },
         ],
+        isError: true,
+      });
+    }
+  },
+);
+
+// ─────────────────────────────────────────────────────────
+// Tool: list_databases
+// ─────────────────────────────────────────────────────────
+
+server.registerTool(
+  "list_databases",
+  {
+    title: "List Persistent Databases",
+    description:
+      "List available persistent knowledge bases. Returns names and sizes of file-backed FTS5 databases that survive across sessions.",
+    inputSchema: z.object({}),
+  },
+  async () => {
+    try {
+      const dbs = ContentStore.listPersistent();
+      if (dbs.length === 0) {
+        return trackResponse("list_databases", {
+          content: [{ type: "text" as const, text: "No persistent databases found. Use index(..., database: \"name\") to create one." }],
+        });
+      }
+      const lines = ["## Persistent Knowledge Bases\n", "| Name | Size |", "|------|------|"];
+      for (const db of dbs) {
+        const size = db.sizeBytes < 1024 ? `${db.sizeBytes}B` : db.sizeBytes < 1048576 ? `${(db.sizeBytes / 1024).toFixed(1)}KB` : `${(db.sizeBytes / 1048576).toFixed(1)}MB`;
+        lines.push(`| ${db.name} | ${size} |`);
+      }
+      lines.push(`\nPath: ${ContentStore.persistentDir}`);
+      return trackResponse("list_databases", {
+        content: [{ type: "text" as const, text: lines.join("\n") }],
+      });
+    } catch (err: unknown) {
+      return trackResponse("list_databases", {
+        content: [{ type: "text" as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      });
+    }
+  },
+);
+
+// ─────────────────────────────────────────────────────────
+// Tool: delete_database
+// ─────────────────────────────────────────────────────────
+
+server.registerTool(
+  "delete_database",
+  {
+    title: "Delete Persistent Database",
+    description: "Delete a named persistent knowledge base and its WAL/SHM files.",
+    inputSchema: z.object({
+      name: z.string().describe("Name of the persistent database to delete."),
+    }),
+  },
+  async ({ name }) => {
+    try {
+      // Close cached connection if open
+      const cached = _namedStores.get(name);
+      if (cached) {
+        cached.cleanup();
+        _namedStores.delete(name);
+      }
+      const deleted = ContentStore.deletePersistent(name);
+      return trackResponse("delete_database", {
+        content: [{ type: "text" as const, text: deleted ? `Deleted persistent database: ${name}` : `Database not found: ${name}` }],
+      });
+    } catch (err: unknown) {
+      return trackResponse("delete_database", {
+        content: [{ type: "text" as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
         isError: true,
       });
     }
@@ -1187,9 +1289,11 @@ async function main() {
     console.error(`Cleaned up ${cleaned} stale DB file(s) from previous sessions`);
   }
 
-  // Clean up own DB on shutdown
+  // Clean up own DB on shutdown (persistent stores are only closed, not deleted)
   const shutdown = () => {
     if (_store) _store.cleanup();
+    for (const store of _namedStores.values()) store.cleanup();
+    _namedStores.clear();
   };
   process.on("exit", shutdown);
   process.on("SIGINT", () => { shutdown(); process.exit(0); });
