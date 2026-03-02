@@ -32,6 +32,7 @@ Bash whitelist (safe to run directly):
 - **Process control**: `kill`, `pkill`
 - **Package management**: `npm install`, `npm publish`, `pip install`
 - **Simple output**: `echo`, `printf`
+- **Gas Town lifecycle**: `gt rig unpark/undock/start/restart/remove/add`, `gt shutdown`, `gt dolt stop/start`, `gt polecat nuke`, `gt deacon stop/start` (blocked in context-mode for safety)
 
 **Everything else → `execute` or `execute_file`.** Any command that reads, queries, fetches, lists, logs, tests, builds, diffs, inspects, or calls an external service. This includes ALL CLIs (gh, aws, kubectl, docker, terraform, wrangler, fly, heroku, gcloud, etc.) — there are thousands and we cannot list them all.
 
@@ -272,6 +273,25 @@ Subagents automatically receive context-mode tool routing via a PreToolUse hook.
 - Passing ANY large data to `index(content: ...)` → data enters context as a parameter. **Always** use `index(path: ...)` to read server-side. The `content` parameter should only be used for small inline text you're composing yourself.
 - Calling an MCP tool (Context7 `query-docs`, GitHub API, etc.) then passing the response to `index(content: response)` → **doubles** context usage. The response is already in context — use it directly or save to file first.
 - Ignoring `browser_navigate` auto-snapshot → navigation response includes a full page snapshot. Don't rely on it for inspection — call `browser_snapshot(filename)` separately.
+
+## Blocked Commands (Safety)
+
+Context-mode blocks Gas Town lifecycle commands at the server level. These commands
+will return an error if attempted through `execute` or `batch_execute`. They MUST
+be run through Bash (where the user's permission system can intercept them):
+
+- `gt rig unpark/undock/start/restart/reboot/remove/add`
+- `gt shutdown`
+- `gt dolt stop/start`
+- `gt polecat nuke`
+- `gt deacon stop/start`
+
+**Why:** These commands mutate rig state (starting/stopping services, removing infrastructure).
+Running them through context-mode bypasses the user's tool approval flow. A previous incident
+caused a parked rig to be unparked without user consent because the LLM routed `gt rig unpark`
+through `execute` instead of Bash.
+
+**Rule:** If a command manages infrastructure lifecycle, use Bash — never context-mode.
 
 ## Cross-Agent Knowledge Sharing
 
