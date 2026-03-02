@@ -82,6 +82,39 @@ function trackIndexed(bytes: number): void {
   sessionStats.bytesIndexed += bytes;
 }
 
+// ─────────────────────────────────────────────────────────
+// Safety: Block dangerous Gas Town commands
+// ─────────────────────────────────────────────────────────
+
+/** Commands that mutate rig lifecycle state — must never run inside context-mode. */
+const BLOCKED_GT_PATTERNS: RegExp[] = [
+  /\bgt\s+rig\s+unpark\b/,
+  /\bgt\s+rig\s+undock\b/,
+  /\bgt\s+rig\s+start\b/,
+  /\bgt\s+rig\s+restart\b/,
+  /\bgt\s+rig\s+reboot\b/,
+  /\bgt\s+rig\s+remove\b/,
+  /\bgt\s+rig\s+add\b/,
+  /\bgt\s+shutdown\b/,
+  /\bgt\s+dolt\s+stop\b/,
+  /\bgt\s+dolt\s+start\b/,
+  /\bgt\s+polecat\s+nuke\b/,
+  /\bgt\s+deacon\s+stop\b/,
+  /\bgt\s+deacon\s+start\b/,
+];
+
+/**
+ * Check if code/command contains blocked Gas Town operations.
+ * Returns the matched command string if blocked, or null if safe.
+ */
+function checkBlockedCommand(code: string): string | null {
+  for (const pattern of BLOCKED_GT_PATTERNS) {
+    const match = code.match(pattern);
+    if (match) return match[0];
+  }
+  return null;
+}
+
 /** Return a JSON-structured response for better UI rendering (OMP JSON tree view). */
 function jsonResponse(toolName: string, data: Record<string, unknown>, isError = false): ToolResult {
   return trackResponse(toolName, {
@@ -237,6 +270,16 @@ server.registerTool(
   },
   async ({ language, code, timeout, intent }) => {
     try {
+      // Safety: block dangerous gt commands in shell code
+      if (language === "shell") {
+        const blocked = checkBlockedCommand(code);
+        if (blocked) {
+          return jsonResponse("execute", {
+            error: `Blocked: "${blocked}" is a protected Gas Town operation and cannot be run through context-mode.`,
+          }, true);
+        }
+      }
+
       // For JS/TS: wrap in async IIFE with fetch interceptor to track network bytes
       let instrumentedCode = code;
       if (language === "javascript" || language === "typescript") {
@@ -432,6 +475,16 @@ server.registerTool(
   },
   async ({ path, language, code, timeout, intent }) => {
     try {
+      // Safety: block dangerous gt commands in shell code
+      if (language === "shell") {
+        const blocked = checkBlockedCommand(code);
+        if (blocked) {
+          return jsonResponse("execute_file", {
+            error: `Blocked: "${blocked}" is a protected Gas Town operation and cannot be run through context-mode.`,
+          }, true);
+        }
+      }
+
       const result = await executor.executeFile({ path, language, code, timeout });
 
       if (result.timedOut) {
@@ -781,6 +834,16 @@ server.registerTool(
   },
   async ({ commands, queries, timeout, database }) => {
     try {
+      // Safety: block dangerous gt commands in any batch command
+      for (const c of commands) {
+        const blocked = checkBlockedCommand(c.command);
+        if (blocked) {
+          return jsonResponse("batch_execute", {
+            error: `Blocked: "${blocked}" in command "${c.label}" is a protected Gas Town operation and cannot be run through context-mode.`,
+          }, true);
+        }
+      }
+
       // Build batch script with markdown section headers for proper chunking
       const script = commands
         .map((c) => {
