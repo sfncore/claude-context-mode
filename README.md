@@ -184,10 +184,68 @@ Fetch the React useEffect docs, index them, and find the cleanup pattern
 with code examples. Then run /context-mode:stats.
 ```
 
+## OMP (Oh My Pi) Integration
+
+Context Mode works as an MCP server in [OMP](https://github.com/can1357/oh-my-pi), giving Qwen and other models the same context-saving tools Claude Code gets.
+
+### Quick Setup
+
+1. **Add MCP server config** (`~/.omp/agent/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "context-mode": {
+      "command": "node",
+      "args": ["/path/to/context-mode/start.mjs"]
+    }
+  }
+}
+```
+
+If installed as a Claude Code plugin, the path is:
+`~/.claude/plugins/cache/claude-context-mode/context-mode/<version>/start.mjs`
+
+2. **Add the routing skill** (`~/.omp/agent/skills/context-mode/SKILL.md`):
+
+Copy from [.omp/skills/context-mode/SKILL.md](.omp/skills/context-mode/SKILL.md) — teaches models when to use context-mode tools vs raw shell.
+
+3. **Add the routing hook** (optional, `~/.omp/agent/hooks/context-mode-routing.ts`):
+
+Copy from [.omp/hooks/context-mode-routing.ts](.omp/hooks/context-mode-routing.ts) — intercepts tool calls and suggests context-mode alternatives for large-output commands.
+
+4. **Restart OMP** — it discovers MCP servers at session start.
+
+### What Works
+
+- All 7 tools: `execute`, `execute_file`, `index`, `search`, `fetch_and_index`, `batch_execute`, `stats`
+- Skill and hook work for both main agent and subagents
+- No OMP rebuild needed — runtime config only
+
+## Persistent Knowledge Bases
+
+Context Mode supports named persistent databases that survive across sessions, enabling knowledge reuse between agents.
+
+```
+# Index into a named persistent DB
+index(content: "...", source: "my-docs", database: "project-kb")
+
+# Search a persistent DB in a later session
+search(queries: ["how to authenticate"], database: "project-kb")
+
+# List all persistent DBs
+list_databases()
+
+# Delete a persistent DB
+delete_database(name: "project-kb")
+```
+
+Persistent databases are stored at `~/.claude/context-mode/<name>.db` using SQLite WAL mode for concurrent read safety. The `database` parameter is available on `index`, `search`, and `batch_execute` tools. Omitting it uses the default ephemeral (session-only) store.
+
 ## Requirements
 
 - **Node.js 18+**
-- **Claude Code** with MCP support
+- **Claude Code** or **OMP** with MCP support
 - Optional: Bun (auto-detected, 3-5x faster JS/TS)
 
 ## Development
