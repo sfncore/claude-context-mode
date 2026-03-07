@@ -216,6 +216,39 @@ function checkFilePathDenyPolicy(
   return null;
 }
 
+// ─────────────────────────────────────────────────────────
+// Safety: Block dangerous Gas Town commands
+// ─────────────────────────────────────────────────────────
+
+/** Commands that mutate rig lifecycle state — must never run inside context-mode. */
+const BLOCKED_GT_PATTERNS: RegExp[] = [
+  /\bgt\s+rig\s+unpark\b/,
+  /\bgt\s+rig\s+undock\b/,
+  /\bgt\s+rig\s+start\b/,
+  /\bgt\s+rig\s+restart\b/,
+  /\bgt\s+rig\s+reboot\b/,
+  /\bgt\s+rig\s+remove\b/,
+  /\bgt\s+rig\s+add\b/,
+  /\bgt\s+shutdown\b/,
+  /\bgt\s+dolt\s+stop\b/,
+  /\bgt\s+dolt\s+start\b/,
+  /\bgt\s+polecat\s+nuke\b/,
+  /\bgt\s+deacon\s+stop\b/,
+  /\bgt\s+deacon\s+start\b/,
+];
+
+/**
+ * Check if code/command contains blocked Gas Town operations.
+ * Returns the matched command string if blocked, or null if safe.
+ */
+function checkBlockedCommand(code: string): string | null {
+  for (const pattern of BLOCKED_GT_PATTERNS) {
+    const match = code.match(pattern);
+    if (match) return match[0];
+  }
+  return null;
+}
+
 // Build description dynamically based on detected runtimes
 const langList = available.join(", ");
 const bunNote = hasBunRuntime()
@@ -401,6 +434,17 @@ server.registerTool(
     } else {
       const denied = checkNonShellDenyPolicy(code, language, "execute");
       if (denied) return denied;
+    }
+
+    // Safety: block dangerous gt commands in shell code
+    if (language === "shell") {
+      const blocked = checkBlockedCommand(code);
+      if (blocked) {
+        return trackResponse("execute", {
+          content: [{ type: "text", text: `Blocked: "${blocked}" is a protected Gas Town operation and cannot be run through context-mode.` }],
+          isError: true,
+        });
+      }
     }
 
     try {
@@ -696,6 +740,17 @@ server.registerTool(
     } else {
       const codeDenied = checkNonShellDenyPolicy(code, language, "execute_file");
       if (codeDenied) return codeDenied;
+    }
+
+    // Safety: block dangerous gt commands in shell code
+    if (language === "shell") {
+      const blocked = checkBlockedCommand(code);
+      if (blocked) {
+        return trackResponse("execute_file", {
+          content: [{ type: "text", text: `Blocked: "${blocked}" is a protected Gas Town operation and cannot be run through context-mode.` }],
+          isError: true,
+        });
+      }
     }
 
     try {
@@ -1269,6 +1324,17 @@ server.registerTool(
     for (const cmd of commands) {
       const denied = checkDenyPolicy(cmd.command, "batch_execute");
       if (denied) return denied;
+    }
+
+    // Safety: block dangerous gt commands in any batch command
+    for (const c of commands) {
+      const blocked = checkBlockedCommand(c.command);
+      if (blocked) {
+        return trackResponse("batch_execute", {
+          content: [{ type: "text", text: `Blocked: "${blocked}" in command "${c.label}" is a protected Gas Town operation and cannot be run through context-mode.` }],
+          isError: true,
+        });
+      }
     }
 
     try {
