@@ -10,6 +10,7 @@ import { homedir, tmpdir } from "node:os";
 import { z } from "zod";
 import { PolyglotExecutor } from "./executor.js";
 import { ContentStore, cleanupStaleDBs, type SearchResult, type IndexResult } from "./store.js";
+import { loadDatabase } from "./db-base.js";
 import {
   readBashPolicies,
   evaluateCommandDenyOnly,
@@ -77,6 +78,23 @@ function getStore(): ContentStore {
   if (!_store) _store = new ContentStore();
   maybeIndexSessionEvents(_store);
   return _store;
+}
+
+// Named persistent store cache
+const _namedStores = new Map<string, ContentStore>();
+
+function getNamedStore(name: string): ContentStore {
+  let store = _namedStores.get(name);
+  if (!store) {
+    store = ContentStore.openNamed(name);
+    _namedStores.set(name, store);
+  }
+  return store;
+}
+
+/** Get the ephemeral store or a named persistent store. */
+function resolveStore(database?: string): ContentStore {
+  return database ? getNamedStore(database) : getStore();
 }
 
 // ─────────────────────────────────────────────────────────
@@ -789,9 +807,13 @@ server.registerTool(
         .describe(
           "Label for the indexed content (e.g., 'Context7: React useEffect', 'Skill: frontend-design')",
         ),
+      database: z
+        .string()
+        .optional()
+        .describe("Named persistent DB. Omit for ephemeral storage."),
     }),
   },
-  async ({ content, path, source }) => {
+  async ({ content, path, source, database }) => {
     if (!content && !path) {
       return trackResponse("ctx_index", {
         content: [
@@ -813,14 +835,15 @@ server.registerTool(
           trackIndexed(fs.readFileSync(path).byteLength);
         } catch { /* ignore — file read errors handled by store */ }
       }
-      const store = getStore();
+      const store = resolveStore(database);
       const result = store.index({ content, path, source });
 
+      const dbNote = database ? ` [DB: ${database}]` : "";
       return trackResponse("ctx_index", {
         content: [
           {
             type: "text" as const,
-            text: `Indexed ${result.totalChunks} sections (${result.codeChunks} with code) from: ${result.label}\nUse search(queries: ["..."]) to query this content. Use source: "${result.label}" to scope results.`,
+            text: `Indexed ${result.totalChunks} sections (${result.codeChunks} with code) from: ${result.label}${dbNote}\nUse search(queries: ["..."]) to query this content. Use source: "${result.label}" to scope results.`,
           },
         ],
       });
@@ -868,12 +891,16 @@ server.registerTool(
         .string()
         .optional()
         .describe("Filter to a specific indexed source (partial match)."),
+      database: z
+        .string()
+        .optional()
+        .describe("Named persistent DB. Omit for ephemeral."),
     }),
   },
   async (params) => {
     try {
-      const store = getStore();
       const raw = params as Record<string, unknown>;
+      const store = resolveStore(raw.database as string | undefined);
 
       // Normalize: accept both query (string) and queries (array)
       const queryList: string[] = [];
@@ -1231,9 +1258,13 @@ server.registerTool(
         .optional()
         .default(60000)
         .describe("Max execution time in ms (default: 60s)"),
+      database: z
+        .string()
+        .optional()
+        .describe("Named persistent DB. Omit for ephemeral."),
     }),
   },
-  async ({ commands, queries, timeout }) => {
+  async ({ commands, queries, timeout, database }) => {
     // Security: check each command against deny patterns
     for (const cmd of commands) {
       const denied = checkDenyPolicy(cmd.command, "batch_execute");
@@ -1302,7 +1333,7 @@ server.registerTool(
       trackIndexed(totalBytes);
 
       // Index into knowledge base — markdown heading chunking splits by # labels
-      const store = getStore();
+      const store = resolveStore(database);
       const source = `batch:${commands
         .map((c) => c.label)
         .join(",")
@@ -1393,6 +1424,271 @@ server.registerTool(
             text: `Batch execution error: ${message}`,
           },
         ],
+        isError: true,
+      });
+    }
+  },
+);
+
+// ─────────────────────────────────────────────────────────
+// Tool: list_databases
+// ─────────────────────────────────────────────────────────
+
+server.registerTool(
+  "ctx_list_databases",
+  {
+    title: "List Persistent Databases",
+    description: "List persistent knowledge bases with names and sizes.",
+    inputSchema: z.object({}),
+  },
+  async () => {
+    try {
+      const dbs = ContentStore.listPersistent();
+      return trackResponse("ctx_list_databases", {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({
+            databases: dbs.map(db => ({ name: db.name, size: `${(db.sizeBytes / 1024).toFixed(1)}KB` })),
+          }, null, 2),
+        }],
+      });
+    } catch (err: unknown) {
+      return trackResponse("ctx_list_databases", {
+        content: [{ type: "text" as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      });
+    }
+  },
+);
+
+// ─────────────────────────────────────────────────────────
+// Tool: delete_database
+// ─────────────────────────────────────────────────────────
+
+server.registerTool(
+  "ctx_delete_database",
+  {
+    title: "Delete Persistent Database",
+    description: "Delete a named persistent knowledge base.",
+    inputSchema: z.object({
+      name: z.string().describe("Database name to delete"),
+    }),
+  },
+  async ({ name }) => {
+    try {
+      // Close if open in cache
+      const cached = _namedStores.get(name);
+      if (cached) {
+        try { cached.close(); } catch { /* ignore */ }
+        _namedStores.delete(name);
+      }
+      const deleted = ContentStore.deletePersistent(name);
+      return trackResponse("ctx_delete_database", {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({ name, deleted }, null, 2),
+        }],
+      });
+    } catch (err: unknown) {
+      return trackResponse("ctx_delete_database", {
+        content: [{ type: "text" as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      });
+    }
+  },
+);
+
+// ─────────────────────────────────────────────────────────
+// Peer discovery helpers
+// ─────────────────────────────────────────────────────────
+
+/** Extract PID from a context-mode DB filename. */
+function pidFromDbPath(dbPath: string): number {
+  const m = dbPath.match(/context-mode-(\d+)\.db$/);
+  return m ? Number(m[1]) : 0;
+}
+
+/** Discover peer context-mode DBs in /tmp/. Returns paths excluding own PID. */
+function discoverPeerDbs(): string[] {
+  const ownFile = `context-mode-${process.pid}.db`;
+  try {
+    return readdirSync(tmpdir())
+      .filter(f => f.startsWith("context-mode-") && f.endsWith(".db")
+        && !f.endsWith("-wal") && !f.endsWith("-shm") && f !== ownFile)
+      .map(f => join(tmpdir(), f));
+  } catch { return []; }
+}
+
+/** Resolve PID to a human-readable role label via /proc/{pid}/environ (Linux only). */
+function roleForPid(pid: number): string {
+  try {
+    const raw = readFileSync(`/proc/${pid}/environ`, "utf-8");
+    const env = Object.fromEntries(
+      raw.split("\0").filter(Boolean).map(e => {
+        const i = e.indexOf("=");
+        return i > 0 ? [e.slice(0, i), e.slice(i + 1)] : [e, ""];
+      }),
+    );
+    const role = env.GT_ROLE;
+    const agent = env.GT_AGENT;
+    if (role) {
+      const parts = role.split("/");
+      let label: string;
+      if (parts.includes("polecats")) {
+        const name = parts[parts.indexOf("polecats") + 1];
+        label = name ? `polecat/${name}` : "polecat";
+      } else if (parts.includes("crew")) {
+        const name = parts[parts.indexOf("crew") + 1];
+        label = name ? `crew/${name}` : "crew";
+      } else {
+        label = parts[parts.length - 1];
+      }
+      return agent ? `${label} (${agent})` : label;
+    }
+    return agent ? `unknown (${agent})` : `PID ${pid}`;
+  } catch {
+    return `PID ${pid}`;
+  }
+}
+
+// ─────────────────────────────────────────────────────────
+// Tool: list_peers
+// ─────────────────────────────────────────────────────────
+
+server.registerTool(
+  "ctx_list_peers",
+  {
+    title: "List Peers",
+    description: "Discover other running context-mode agents and their indexed knowledge. Use before search_peers.",
+    inputSchema: z.object({}),
+  },
+  async () => {
+    try {
+      const peers = discoverPeerDbs();
+      if (peers.length === 0) {
+        return trackResponse("ctx_list_peers", {
+          content: [{ type: "text" as const, text: JSON.stringify({ peers: [] }) }],
+        });
+      }
+
+      const Database = loadDatabase();
+      const peerList: Array<{ role: string; pid: number; chunks: number; sources: string[] }> = [];
+
+      for (const dbPath of peers) {
+        const pid = pidFromDbPath(dbPath);
+        let db;
+        try {
+          db = new Database(dbPath, { readonly: true, timeout: 1000 });
+          db.pragma("journal_mode = WAL");
+          const sources = db.prepare(
+            "SELECT label, (SELECT COUNT(*) FROM chunks c WHERE c.source_id = s.id) AS chunk_count FROM sources s ORDER BY s.id DESC",
+          ).all() as Array<{ label: string; chunk_count: number }>;
+          const totalChunks = sources.reduce((s, r) => s + r.chunk_count, 0);
+          peerList.push({
+            role: roleForPid(pid), pid, chunks: totalChunks,
+            sources: sources.slice(0, 10).map(s => `${s.label} (${s.chunk_count})`),
+          });
+        } catch { /* DB cleaned up or locked */ }
+        finally { try { db?.close(); } catch { /* ignore */ } }
+      }
+
+      return trackResponse("ctx_list_peers", {
+        content: [{ type: "text" as const, text: JSON.stringify({ peers: peerList }, null, 2) }],
+      });
+    } catch (err: unknown) {
+      return trackResponse("ctx_list_peers", {
+        content: [{ type: "text" as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      });
+    }
+  },
+);
+
+// ─────────────────────────────────────────────────────────
+// Tool: search_peers
+// ─────────────────────────────────────────────────────────
+
+server.registerTool(
+  "ctx_search_peers",
+  {
+    title: "Search Peers",
+    description: "Search other agents' indexed knowledge. Read-only. Use list_peers first.",
+    inputSchema: z.object({
+      queries: z.array(z.string()).min(1).describe("Search queries (2-4 terms each)."),
+      source: z.string().optional().describe("Filter by source substring."),
+      limit: z.number().optional().default(5).describe("Max results per query (default 5)"),
+    }),
+  },
+  async ({ queries, source, limit }) => {
+    try {
+      const peers = discoverPeerDbs();
+      if (peers.length === 0) {
+        return trackResponse("ctx_search_peers", {
+          content: [{ type: "text" as const, text: JSON.stringify({ results: [], peers: 0 }) }],
+        });
+      }
+
+      const Database = loadDatabase();
+      const allResults: Array<{
+        title: string; content: string; source: string; rank: number;
+        peer_pid: number; peer_role: string;
+      }> = [];
+
+      for (const dbPath of peers) {
+        const pid = pidFromDbPath(dbPath);
+        const role = roleForPid(pid);
+        let db;
+        try {
+          db = new Database(dbPath, { readonly: true, timeout: 1000 });
+          db.pragma("journal_mode = WAL");
+
+          const sql = source
+            ? `SELECT c.title, c.content, s.label, rank
+               FROM chunks_fts f
+               JOIN chunks c ON c.rowid = f.rowid
+               JOIN sources s ON s.id = c.source_id
+               WHERE chunks_fts MATCH ? AND s.label LIKE ?
+               ORDER BY rank LIMIT ?`
+            : `SELECT c.title, c.content, s.label, rank
+               FROM chunks_fts f
+               JOIN chunks c ON c.rowid = f.rowid
+               JOIN sources s ON s.id = c.source_id
+               WHERE chunks_fts MATCH ?
+               ORDER BY rank LIMIT ?`;
+
+          const stmt = db.prepare(sql);
+
+          for (const query of queries) {
+            const sanitized = query.replace(/[*"():^~{}<>]/g, " ").trim();
+            if (!sanitized) continue;
+            try {
+              const params = source
+                ? [sanitized, `%${source}%`, limit]
+                : [sanitized, limit];
+              const rows = stmt.all(...params) as Array<{
+                title: string; content: string; label: string; rank: number;
+              }>;
+              for (const r of rows) {
+                allResults.push({
+                  title: r.title, content: r.content, source: r.label,
+                  rank: r.rank, peer_pid: pid, peer_role: role,
+                });
+              }
+            } catch { /* query may fail on empty/corrupt DB — skip */ }
+          }
+        } catch { /* DB locked or gone */ }
+        finally { try { db?.close(); } catch { /* ignore */ } }
+      }
+
+      return trackResponse("ctx_search_peers", {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({ results: allResults, queries }, null, 2),
+        }],
+      });
+    } catch (err: unknown) {
+      return trackResponse("ctx_search_peers", {
+        content: [{ type: "text" as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
         isError: true,
       });
     }
@@ -1724,6 +2020,10 @@ async function main() {
   const shutdown = () => {
     executor.cleanupBackgrounded();
     if (_store) _store.cleanup();
+    for (const store of _namedStores.values()) {
+      try { store.close(); } catch { /* ignore */ }
+    }
+    _namedStores.clear();
   };
   process.on("exit", shutdown);
   process.on("SIGINT", () => { shutdown(); process.exit(0); });

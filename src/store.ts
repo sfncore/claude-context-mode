@@ -11,9 +11,9 @@
 import type { Database as DatabaseInstance } from "better-sqlite3";
 import { loadDatabase, applyWALPragmas } from "./db-base.js";
 import type { PreparedStatement } from "./db-base.js";
-import { readFileSync, readdirSync, unlinkSync, existsSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { readFileSync, readdirSync, unlinkSync, existsSync, mkdirSync, statSync } from "node:fs";
+import { tmpdir, homedir } from "node:os";
+import { join, basename } from "node:path";
 
 // ─────────────────────────────────────────────────────────
 // Types
@@ -136,6 +136,7 @@ export function cleanupStaleDBs(): number {
 export class ContentStore {
   #db: DatabaseInstance;
   #dbPath: string;
+  #persistent: boolean;
 
   // ── Cached Prepared Statements ──
   // Prepared once at construction, reused on every call to avoid
@@ -167,23 +168,90 @@ export class ContentStore {
   #stmtChunkContent!: PreparedStatement;
   #stmtStats!: PreparedStatement;
 
-  constructor(dbPath?: string) {
+  /**
+   * @param dbPath - Custom database file path. Defaults to ephemeral temp file.
+   * @param persistent - If true, skip file deletion on cleanup (close DB only).
+   */
+  constructor(dbPath?: string, persistent = false) {
     const Database = loadDatabase();
     this.#dbPath =
       dbPath ?? join(tmpdir(), `context-mode-${process.pid}.db`);
+    this.#persistent = persistent;
     this.#db = new Database(this.#dbPath, { timeout: 5000 });
     applyWALPragmas(this.#db);
     this.#initSchema();
     this.#prepareStatements();
   }
 
-  /** Delete this session's DB files. Call on process exit. */
+  /** Whether this store uses a persistent (non-ephemeral) database. */
+  get persistent(): boolean { return this.#persistent; }
+
+  /** The database file path. */
+  get dbPath(): string { return this.#dbPath; }
+
+  /**
+   * Get the standard directory for persistent knowledge bases.
+   */
+  static get persistentDir(): string {
+    return join(homedir(), ".claude", "context-mode");
+  }
+
+  /**
+   * Get the file path for a named persistent database.
+   */
+  static namedDbPath(name: string): string {
+    const safe = name.replace(/[^a-zA-Z0-9_-]/g, "_");
+    return join(ContentStore.persistentDir, `${safe}.db`);
+  }
+
+  /**
+   * Open or create a named persistent knowledge base.
+   */
+  static openNamed(name: string): ContentStore {
+    const dir = ContentStore.persistentDir;
+    mkdirSync(dir, { recursive: true });
+    return new ContentStore(ContentStore.namedDbPath(name), true);
+  }
+
+  /**
+   * List available persistent databases with metadata.
+   */
+  static listPersistent(): Array<{ name: string; path: string; sizeBytes: number }> {
+    const dir = ContentStore.persistentDir;
+    try {
+      return readdirSync(dir)
+        .filter(f => f.endsWith(".db") && !f.endsWith("-wal") && !f.endsWith("-shm"))
+        .map(f => {
+          const path = join(dir, f);
+          const st = statSync(path);
+          return { name: basename(f, ".db"), path, sizeBytes: st.size };
+        });
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Delete a named persistent database and its WAL/SHM files.
+   */
+  static deletePersistent(name: string): boolean {
+    const path = ContentStore.namedDbPath(name);
+    let deleted = false;
+    for (const suffix of ["", "-wal", "-shm"]) {
+      try { unlinkSync(path + suffix); deleted = true; } catch { /* ignore */ }
+    }
+    return deleted;
+  }
+
+  /** Close DB and delete files. For persistent stores, only closes (no delete). */
   cleanup(): void {
     try {
       this.#db.close();
     } catch { /* ignore */ }
-    for (const suffix of ["", "-wal", "-shm"]) {
-      try { unlinkSync(this.#dbPath + suffix); } catch { /* ignore */ }
+    if (!this.#persistent) {
+      for (const suffix of ["", "-wal", "-shm"]) {
+        try { unlinkSync(this.#dbPath + suffix); } catch { /* ignore */ }
+      }
     }
   }
 

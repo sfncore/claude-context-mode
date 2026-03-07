@@ -291,6 +291,31 @@ Subagents automatically receive context-mode tool routing via a PreToolUse hook.
 - Calling an MCP tool (Context7 `query-docs`, GitHub API, etc.) then passing the response to `ctx_index(content: response)` → **doubles** context usage. The response is already in context — use it directly or save to file first.
 - Ignoring `browser_navigate` auto-snapshot → navigation response includes a full page snapshot. Don't rely on it for inspection — call `browser_snapshot(filename)` separately.
 
+## Persistent Knowledge Bases
+
+Use the `database` parameter on `ctx_index`, `ctx_search`, and `ctx_batch_execute` to store knowledge that survives across sessions.
+
+```
+ctx_index(content: "...", source: "React docs", database: "react-docs")
+ctx_search(queries: ["useEffect cleanup"], database: "react-docs")
+ctx_batch_execute(commands: [...], queries: [...], database: "project-kb")
+```
+
+Management tools:
+- `ctx_list_databases` — list persistent KBs with sizes
+- `ctx_delete_database(name: "old-kb")` — remove a persistent KB
+
+Persistent DBs are stored in `~/.claude/context-mode/{name}.db`. Omit the `database` parameter for ephemeral (session-scoped) storage.
+
+## Peer Discovery (Multi-Agent)
+
+In multi-agent environments (Gas Town), discover and search other agents' indexed knowledge:
+
+- `ctx_list_peers` — find running context-mode agents and their indexed sources
+- `ctx_search_peers(queries: ["error handling"], source: "docs")` — search across peer knowledge bases
+
+Peer search is read-only and identifies agents by role (e.g., `crew/charlie`, `polecat/jade`, `mayor`).
+
 ## Reference Files
 
 - [JavaScript/TypeScript Patterns](./references/patterns-javascript.md)
