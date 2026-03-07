@@ -2,7 +2,7 @@
   "mcpServers": {
     "context-mode": {
       "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/start.mjs"]
+      "args": ["/home/ubuntu/gt/context_mode/crew/charlie/build/server.js"]
     }
   }
 }
