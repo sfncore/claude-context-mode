@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
-import { existsSync, unlinkSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, unlinkSync, readdirSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, tmpdir } from "node:os";
@@ -122,11 +122,67 @@ function trackResponse(toolName: string, response: ToolResult): ToolResult {
   sessionStats.calls[toolName] = (sessionStats.calls[toolName] || 0) + 1;
   sessionStats.bytesReturned[toolName] =
     (sessionStats.bytesReturned[toolName] || 0) + bytes;
+  writeStatsFile();
   return response;
 }
 
 function trackIndexed(bytes: number): void {
   sessionStats.bytesIndexed += bytes;
+}
+
+// ─────────────────────────────────────────────────────────
+// Stats file export — per-PID file for multi-session support
+// ─────────────────────────────────────────────────────────
+
+const STATS_DIR = join(homedir(), ".claude", "context-mode");
+const STATS_FILE = join(STATS_DIR, `stats-${process.pid}.json`);
+
+function writeStatsFile(): void {
+  try {
+    const totalBytesReturned = Object.values(sessionStats.bytesReturned).reduce(
+      (sum, b) => sum + b, 0,
+    );
+    const totalCalls = Object.values(sessionStats.calls).reduce(
+      (sum, c) => sum + c, 0,
+    );
+    const uptimeMs = Date.now() - sessionStats.sessionStart;
+    const keptOut = sessionStats.bytesIndexed + sessionStats.bytesSandboxed;
+    const totalProcessed = keptOut + totalBytesReturned;
+    const savingsRatio = totalProcessed / Math.max(totalBytesReturned, 1);
+    const reductionPct = totalProcessed > 0
+      ? Math.round((1 - totalBytesReturned / totalProcessed) * 100)
+      : 0;
+
+    const stats = {
+      pid: process.pid,
+      session_minutes: +(uptimeMs / 60_000).toFixed(1),
+      total_calls: totalCalls,
+      bytes_processed: totalProcessed,
+      bytes_saved: keptOut,
+      tokens_consumed: Math.round(totalBytesReturned / 4),
+      tokens_saved: Math.round(keptOut / 4),
+      savings_ratio: +savingsRatio.toFixed(1),
+      reduction_pct: reductionPct,
+      updated_at: Date.now(),
+    };
+
+    if (!existsSync(STATS_DIR)) {
+      mkdirSync(STATS_DIR, { recursive: true });
+    }
+    writeFileSync(STATS_FILE, JSON.stringify(stats) + "\n", "utf-8");
+  } catch {
+    // Best effort — never block tool responses
+  }
+}
+
+function removeStatsFile(): void {
+  try {
+    if (existsSync(STATS_FILE)) {
+      unlinkSync(STATS_FILE);
+    }
+  } catch {
+    // Best effort
+  }
 }
 
 // ==============================================================================
@@ -2084,6 +2140,7 @@ async function main() {
 
   // Clean up own DB + backgrounded processes on shutdown
   const shutdown = () => {
+    removeStatsFile();
     executor.cleanupBackgrounded();
     if (_store) _store.cleanup();
     for (const store of _namedStores.values()) {
