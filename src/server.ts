@@ -1624,21 +1624,67 @@ server.registerTool(
 // Peer discovery helpers
 // ─────────────────────────────────────────────────────────
 
+/** A discovered peer database — either ephemeral (PID-based) or persistent (named). */
+interface PeerDb {
+  path: string;
+  kind: "ephemeral" | "persistent";
+  /** PID for ephemeral DBs, 0 for persistent. */
+  pid: number;
+  /** DB name for persistent DBs (e.g. "sfgastown-dunks"), empty for ephemeral. */
+  name: string;
+}
+
 /** Extract PID from a context-mode DB filename. */
 function pidFromDbPath(dbPath: string): number {
   const m = dbPath.match(/context-mode-(\d+)\.db$/);
   return m ? Number(m[1]) : 0;
 }
 
-/** Discover peer context-mode DBs in /tmp/. Returns paths excluding own PID. */
-function discoverPeerDbs(): string[] {
+/** Extract name from a persistent DB filename (e.g. "sfgastown-dunks" from "sfgastown-dunks.db"). */
+function nameFromPersistentDb(filename: string): string {
+  return filename.replace(/\.db$/, "");
+}
+
+/** Discover all peer DBs: ephemeral in /tmp/ + persistent in ~/.claude/context-mode/. */
+function discoverPeerDbs(): PeerDb[] {
+  const results: PeerDb[] = [];
   const ownFile = `context-mode-${process.pid}.db`;
+
+  // Ephemeral DBs in /tmp/
   try {
-    return readdirSync(tmpdir())
+    const ephemeral = readdirSync(tmpdir())
       .filter(f => f.startsWith("context-mode-") && f.endsWith(".db")
         && !f.endsWith("-wal") && !f.endsWith("-shm") && f !== ownFile)
-      .map(f => join(tmpdir(), f));
-  } catch { return []; }
+      .map(f => ({
+        path: join(tmpdir(), f),
+        kind: "ephemeral" as const,
+        pid: pidFromDbPath(join(tmpdir(), f)),
+        name: "",
+      }));
+    results.push(...ephemeral);
+  } catch { /* /tmp/ unreadable */ }
+
+  // Persistent named DBs in ~/.claude/context-mode/
+  try {
+    const persistentDir = ContentStore.persistentDir;
+    // Exclude DBs we currently have open (ephemeral + any named persistent stores)
+    const ownPaths = new Set<string>();
+    if (_store) ownPaths.add(_store.dbPath);
+    for (const s of _namedStores.values()) ownPaths.add(s.dbPath);
+    const persistent = readdirSync(persistentDir)
+      .filter(f => f.endsWith(".db") && !f.endsWith("-wal") && !f.endsWith("-shm"))
+      .map(f => join(persistentDir, f))
+      .filter(p => !ownPaths.has(p))
+      .map(p => ({
+        path: p,
+        kind: "persistent" as const,
+        pid: 0,
+        name: nameFromPersistentDb(p.split("/").pop()!),
+      }));
+    results.push(...persistent);
+  } catch { /* persistent dir may not exist */ }
+
+  return results;
 }
 
 /** Resolve PID to a human-readable role label via /proc/{pid}/environ (Linux only). */
@@ -1673,6 +1719,12 @@ function roleForPid(pid: number): string {
   }
 }
 
+/** Get a human-readable label for a peer DB. */
+function peerLabel(peer: PeerDb): string {
+  if (peer.kind === "persistent") return `db/${peer.name}`;
+  return roleForPid(peer.pid);
+}
+
 // ─────────────────────────────────────────────────────────
 // Tool: list_peers
 // ─────────────────────────────────────────────────────────
@@ -1694,20 +1746,20 @@ server.registerTool(
       }
 
       const Database = loadDatabase();
-      const peerList: Array<{ role: string; pid: number; chunks: number; sources: string[] }> = [];
+      const peerList: Array<{ role: string; pid: number; kind: string; name: string; chunks: number; sources: string[] }> = [];
 
-      for (const dbPath of peers) {
-        const pid = pidFromDbPath(dbPath);
+      for (const peer of peers) {
         let db;
         try {
-          db = new Database(dbPath, { readonly: true, timeout: 1000 });
+          db = new Database(peer.path, { readonly: true, timeout: 1000 });
           db.pragma("journal_mode = WAL");
           const sources = db.prepare(
             "SELECT label, (SELECT COUNT(*) FROM chunks c WHERE c.source_id = s.id) AS chunk_count FROM sources s ORDER BY s.id DESC",
           ).all() as Array<{ label: string; chunk_count: number }>;
           const totalChunks = sources.reduce((s, r) => s + r.chunk_count, 0);
           peerList.push({
-            role: roleForPid(pid), pid, chunks: totalChunks,
+            role: peerLabel(peer), pid: peer.pid, kind: peer.kind, name: peer.name,
+            chunks: totalChunks,
             sources: sources.slice(0, 10).map(s => `${s.label} (${s.chunk_count})`),
           });
         } catch { /* DB cleaned up or locked */ }
@@ -1753,29 +1805,28 @@ server.registerTool(
       const Database = loadDatabase();
       const allResults: Array<{
         title: string; content: string; source: string; rank: number;
-        peer_pid: number; peer_role: string;
+        peer_pid: number; peer_role: string; peer_kind: string; peer_name: string;
       }> = [];
 
-      for (const dbPath of peers) {
-        const pid = pidFromDbPath(dbPath);
-        const role = roleForPid(pid);
+      for (const peer of peers) {
+        const role = peerLabel(peer);
         let db;
         try {
-          db = new Database(dbPath, { readonly: true, timeout: 1000 });
+          db = new Database(peer.path, { readonly: true, timeout: 1000 });
           db.pragma("journal_mode = WAL");
 
           const sql = source
-            ? `SELECT c.title, c.content, s.label, rank
-               FROM chunks_fts f
-               JOIN chunks c ON c.rowid = f.rowid
-               JOIN sources s ON s.id = c.source_id
-               WHERE chunks_fts MATCH ? AND s.label LIKE ?
+            ? `SELECT chunks_trigram.title, chunks_trigram.content, sources.label,
+                      bm25(chunks_trigram, 2.0, 1.0) AS rank
+               FROM chunks_trigram
+               JOIN sources ON sources.id = chunks_trigram.source_id
+               WHERE chunks_trigram MATCH ? AND sources.label LIKE ?
                ORDER BY rank LIMIT ?`
-            : `SELECT c.title, c.content, s.label, rank
-               FROM chunks_fts f
-               JOIN chunks c ON c.rowid = f.rowid
-               JOIN sources s ON s.id = c.source_id
-               WHERE chunks_fts MATCH ?
+            : `SELECT chunks_trigram.title, chunks_trigram.content, sources.label,
+                      bm25(chunks_trigram, 2.0, 1.0) AS rank
+               FROM chunks_trigram
+               JOIN sources ON sources.id = chunks_trigram.source_id
+               WHERE chunks_trigram MATCH ?
                ORDER BY rank LIMIT ?`;
 
           const stmt = db.prepare(sql);
@@ -1793,7 +1844,8 @@ server.registerTool(
               for (const r of rows) {
                 allResults.push({
                   title: r.title, content: r.content, source: r.label,
-                  rank: r.rank, peer_pid: pid, peer_role: role,
+                  rank: r.rank, peer_pid: peer.pid, peer_role: role,
+                  peer_kind: peer.kind, peer_name: peer.name,
                 });
               }
             } catch { /* query may fail on empty/corrupt DB — skip */ }
@@ -1810,6 +1862,74 @@ server.registerTool(
       });
     } catch (err: unknown) {
       return trackResponse("ctx_search_peers", {
+        content: [{ type: "text" as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      });
+    }
+  },
+);
+
+// ─────────────────────────────────────────────────────────
+// Tool: get_skill
+// ─────────────────────────────────────────────────────────
+
+/** Resolve the plugin root for skill files. Checks local plugin dir, then falls back to package dir. */
+function resolveSkillsDir(): string | null {
+  const candidates = [
+    join(homedir(), ".claude", "plugins", "local", "context-mode", "skills"),
+    join(fileURLToPath(import.meta.url), "..", "..", "skills"),
+  ];
+  for (const dir of candidates) {
+    try { readdirSync(dir); return dir; } catch { /* not found */ }
+  }
+  return null;
+}
+
+server.registerTool(
+  "ctx_get_skill",
+  {
+    title: "Get Skill",
+    description:
+      "Load a context-mode skill by name. Returns the latest skill content from disk — always fresh, no restart needed. " +
+      "Use without arguments to list available skills.",
+    inputSchema: z.object({
+      name: z.string().optional().describe("Skill name (e.g. 'context-mode'). Omit to list available skills."),
+    }),
+  },
+  async ({ name }) => {
+    try {
+      const skillsDir = resolveSkillsDir();
+      if (!skillsDir) {
+        return trackResponse("ctx_get_skill", {
+          content: [{ type: "text" as const, text: "Error: skills directory not found" }],
+          isError: true,
+        });
+      }
+
+      if (!name) {
+        // List available skills
+        const entries = readdirSync(skillsDir, { withFileTypes: true });
+        const skills: string[] = [];
+        for (const e of entries) {
+          if (e.isDirectory()) {
+            try {
+              readFileSync(join(skillsDir, e.name, "SKILL.md"), "utf-8");
+              skills.push(e.name);
+            } catch { /* no SKILL.md — skip */ }
+          }
+        }
+        return trackResponse("ctx_get_skill", {
+          content: [{ type: "text" as const, text: JSON.stringify({ skills, dir: skillsDir }) }],
+        });
+      }
+
+      const skillPath = join(skillsDir, name, "SKILL.md");
+      const content = readFileSync(skillPath, "utf-8");
+      return trackResponse("ctx_get_skill", {
+        content: [{ type: "text" as const, text: content }],
+      });
+    } catch (err: unknown) {
+      return trackResponse("ctx_get_skill", {
         content: [{ type: "text" as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
         isError: true,
       });
