@@ -275,21 +275,13 @@ function checkFilePathDenyPolicy(
 // Safety: Block dangerous Gas Town commands
 // ─────────────────────────────────────────────────────────
 
-/** Commands that mutate rig lifecycle state — must never run inside context-mode. */
+/** Commands that destroy or stop infrastructure — must never run inside context-mode. */
 const BLOCKED_GT_PATTERNS: RegExp[] = [
-  /\bgt\s+rig\s+unpark\b/,
-  /\bgt\s+rig\s+undock\b/,
-  /\bgt\s+rig\s+start\b/,
-  /\bgt\s+rig\s+restart\b/,
-  /\bgt\s+rig\s+reboot\b/,
   /\bgt\s+rig\s+remove\b/,
-  /\bgt\s+rig\s+add\b/,
   /\bgt\s+shutdown\b/,
   /\bgt\s+dolt\s+stop\b/,
-  /\bgt\s+dolt\s+start\b/,
   /\bgt\s+polecat\s+nuke\b/,
   /\bgt\s+deacon\s+stop\b/,
-  /\bgt\s+deacon\s+start\b/,
 ];
 
 /**
