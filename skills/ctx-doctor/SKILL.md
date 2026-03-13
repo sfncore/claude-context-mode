@@ -4,7 +4,7 @@ description: |
   Run context-mode diagnostics. Checks runtimes, hooks, FTS5,
   plugin registration, npm and marketplace versions.
   Trigger: /context-mode:ctx-doctor
-user_invocable: true
+user-invocable: true
 ---
 
 # Context Mode Doctor

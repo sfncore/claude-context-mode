@@ -2,21 +2,19 @@
 name: context-mode
 description: |
   Use context-mode tools (ctx_execute, ctx_execute_file) instead of Bash/cat when processing
-  large outputs. Trigger phrases: "analyze logs", "summarize output", "process data",
+  large outputs. Triggers: "analyze logs", "summarize output", "process data",
   "parse JSON", "filter results", "extract errors", "check build output",
   "analyze dependencies", "process API response", "large file analysis",
-  "extract elements", "page snapshot", "browser snapshot", "take a snapshot",
-  "DOM structure", "inspect page", "form fields", "element selectors",
-  "web page structure", "accessibility tree", "Playwright snapshot",
+  "page snapshot", "browser snapshot", "DOM structure", "inspect page",
+  "accessibility tree", "Playwright snapshot",
   "run tests", "test output", "coverage report", "git log", "recent commits",
   "diff between branches", "list containers", "pod status", "disk usage",
-  "fetch docs", "API reference", "index documentation", "hit endpoint",
-  "call API", "check response", "query results", "show tables",
+  "fetch docs", "API reference", "index documentation",
+  "call API", "check response", "query results",
   "find TODOs", "count lines", "codebase statistics", "security audit",
   "outdated packages", "dependency tree", "cloud resources", "CI/CD output".
-  Also triggers on ANY MCP tool output (Playwright, Context7, GitHub API) that
-  may exceed 20 lines, and any operation where output size is uncertain.
-  Subagent routing is handled automatically via PreToolUse hook — no manual tool names needed in prompts.
+  Also triggers on ANY MCP tool output that may exceed 20 lines.
+  Subagent routing is handled automatically via PreToolUse hook.
 ---
 
 # Context Mode: Default for All Large Output

@@ -25,8 +25,7 @@ import {
   hasBunRuntime,
 } from "./runtime.js";
 import { classifyNonZeroExit } from "./exit-classify.js";
-
-const VERSION = "1.0.14";
+const VERSION = "1.0.18";
 
 // Prevent silent server death from unhandled async errors
 process.on("unhandledRejection", (err) => {
@@ -2268,9 +2267,13 @@ async function main() {
     }
     _namedStores.clear();
   };
+  const gracefulShutdown = async () => {
+    shutdown();
+    process.exit(0);
+  };
   process.on("exit", shutdown);
-  process.on("SIGINT", () => { shutdown(); process.exit(0); });
-  process.on("SIGTERM", () => { shutdown(); process.exit(0); });
+  process.on("SIGINT", () => { gracefulShutdown(); });
+  process.on("SIGTERM", () => { gracefulShutdown(); });
 
   const transport = new StdioServerTransport();
   await server.connect(transport);

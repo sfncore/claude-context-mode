@@ -320,57 +320,78 @@ export class ClaudeCodeAdapter implements HookAdapter {
 
     const hooks = settings.hooks as Record<string, unknown[]> | undefined;
 
-    // Check PreToolUse
-    const preToolUse = hooks?.PreToolUse as
-      | Array<{ matcher?: string; hooks?: Array<{ command?: string }> }>
-      | undefined;
-    if (preToolUse && preToolUse.length > 0) {
-      const hasHook = preToolUse.some((entry) =>
-        isContextModeHook(entry, HOOK_TYPES.PRE_TOOL_USE),
-      );
-      results.push({
-        check: "PreToolUse hook",
-        status: hasHook ? "pass" : "fail",
-        message: hasHook
-          ? "PreToolUse hook configured"
-          : "PreToolUse exists but does not point to pretooluse.mjs",
-        fix: hasHook ? undefined : "context-mode upgrade",
-      });
-    } else {
-      results.push({
-        check: "PreToolUse hook",
-        status: "fail",
-        message: "No PreToolUse hooks found",
-        fix: "context-mode upgrade",
-      });
-    }
+    // Read plugin hooks.json as fallback (Issue #94: plugin installs
+    // register hooks in hooks/hooks.json, not in settings.json)
+    const pluginHooks = this.readPluginHooks(pluginRoot);
 
-    // Check SessionStart
-    const sessionStart = hooks?.SessionStart as
-      | Array<{ matcher?: string; hooks?: Array<{ command?: string }> }>
-      | undefined;
-    if (sessionStart && sessionStart.length > 0) {
-      const hasHook = sessionStart.some((entry) =>
-        isContextModeHook(entry, HOOK_TYPES.SESSION_START),
-      );
-      results.push({
-        check: "SessionStart hook",
-        status: hasHook ? "pass" : "fail",
-        message: hasHook
-          ? "SessionStart hook configured"
-          : "SessionStart exists but does not point to sessionstart.mjs",
-        fix: hasHook ? undefined : "context-mode upgrade",
-      });
-    } else {
-      results.push({
-        check: "SessionStart hook",
-        status: "fail",
-        message: "No SessionStart hooks found",
-        fix: "context-mode upgrade",
-      });
-    }
+    // Check PreToolUse (settings.json first, then plugin hooks.json fallback)
+    const hasPreToolUse = this.checkHookType(hooks, pluginHooks, HOOK_TYPES.PRE_TOOL_USE);
+    results.push({
+      check: "PreToolUse hook",
+      status: hasPreToolUse ? "pass" : "fail",
+      message: hasPreToolUse
+        ? "PreToolUse hook configured"
+        : "No PreToolUse hooks found",
+      fix: hasPreToolUse ? undefined : "context-mode upgrade",
+    });
+
+    // Check SessionStart (settings.json first, then plugin hooks.json fallback)
+    const hasSessionStart = this.checkHookType(hooks, pluginHooks, HOOK_TYPES.SESSION_START);
+    results.push({
+      check: "SessionStart hook",
+      status: hasSessionStart ? "pass" : "fail",
+      message: hasSessionStart
+        ? "SessionStart hook configured"
+        : "No SessionStart hooks found",
+      fix: hasSessionStart ? undefined : "context-mode upgrade",
+    });
 
     return results;
+  }
+
+  /** Read plugin hooks from hooks/hooks.json or .claude-plugin/hooks/hooks.json */
+  private readPluginHooks(
+    pluginRoot: string,
+  ): Record<string, unknown[]> | undefined {
+    const candidates = [
+      join(pluginRoot, "hooks", "hooks.json"),
+      join(pluginRoot, ".claude-plugin", "hooks", "hooks.json"),
+    ];
+    for (const candidate of candidates) {
+      try {
+        const raw = readFileSync(candidate, "utf-8");
+        const parsed = JSON.parse(raw) as { hooks?: Record<string, unknown[]> };
+        if (parsed.hooks) return parsed.hooks;
+      } catch { /* not available */ }
+    }
+    return undefined;
+  }
+
+  /** Check if a hook type is configured in either settings.json or plugin hooks */
+  private checkHookType(
+    settingsHooks: Record<string, unknown[]> | undefined,
+    pluginHooks: Record<string, unknown[]> | undefined,
+    hookType: HookType,
+  ): boolean {
+    type HookEntry = { matcher?: string; hooks?: Array<{ command?: string }> };
+
+    // Check settings.json
+    const fromSettings = settingsHooks?.[hookType] as HookEntry[] | undefined;
+    if (fromSettings && fromSettings.length > 0) {
+      if (fromSettings.some((entry) => isContextModeHook(entry, hookType))) {
+        return true;
+      }
+    }
+
+    // Fallback: check plugin hooks.json
+    const fromPlugin = pluginHooks?.[hookType] as HookEntry[] | undefined;
+    if (fromPlugin && fromPlugin.length > 0) {
+      if (fromPlugin.some((entry) => isContextModeHook(entry, hookType))) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   checkPluginRegistration(): DiagnosticResult {

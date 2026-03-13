@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { createHash } from "node:crypto";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { ClaudeCodeAdapter } from "../../src/adapters/claude-code/index.js";
 
 describe("ClaudeCodeAdapter", () => {
@@ -202,6 +203,115 @@ describe("ClaudeCodeAdapter", () => {
       expect(dbPath).toBe(
         join(homedir(), ".claude", "context-mode", "sessions", `${hash}.db`),
       );
+    });
+  });
+
+  // ── validateHooks (Issue #94) ─────────────────────────
+
+  describe("validateHooks", () => {
+    let tempDir: string;
+    let pluginRoot: string;
+
+    beforeEach(() => {
+      tempDir = mkdtempSync(join(tmpdir(), "claude-doctor-test-"));
+      pluginRoot = mkdtempSync(join(tmpdir(), "plugin-root-test-"));
+      Object.defineProperty(adapter, "getSettingsPath", {
+        value: () => join(tempDir, "settings.json"),
+        configurable: true,
+      });
+    });
+
+    afterEach(() => {
+      rmSync(tempDir, { recursive: true, force: true });
+      rmSync(pluginRoot, { recursive: true, force: true });
+    });
+
+    it("returns PASS when hooks exist in plugin hooks.json but not settings.json", () => {
+      writeFileSync(join(tempDir, "settings.json"), JSON.stringify({}));
+
+      mkdirSync(join(pluginRoot, "hooks"), { recursive: true });
+      writeFileSync(
+        join(pluginRoot, "hooks", "hooks.json"),
+        JSON.stringify({
+          hooks: {
+            PreToolUse: [{
+              matcher: "Bash",
+              hooks: [{ type: "command", command: "node ${CLAUDE_PLUGIN_ROOT}/hooks/pretooluse.mjs" }],
+            }],
+            SessionStart: [{
+              matcher: "",
+              hooks: [{ type: "command", command: "node ${CLAUDE_PLUGIN_ROOT}/hooks/sessionstart.mjs" }],
+            }],
+          },
+        }),
+      );
+
+      const results = adapter.validateHooks(pluginRoot);
+      const preToolUse = results.find((r) => r.check === "PreToolUse hook");
+      const sessionStart = results.find((r) => r.check === "SessionStart hook");
+      expect(preToolUse?.status).toBe("pass");
+      expect(sessionStart?.status).toBe("pass");
+    });
+
+    it("returns PASS when hooks exist in .claude-plugin/hooks/hooks.json", () => {
+      writeFileSync(join(tempDir, "settings.json"), JSON.stringify({}));
+
+      mkdirSync(join(pluginRoot, ".claude-plugin", "hooks"), { recursive: true });
+      writeFileSync(
+        join(pluginRoot, ".claude-plugin", "hooks", "hooks.json"),
+        JSON.stringify({
+          hooks: {
+            PreToolUse: [{
+              matcher: "Bash",
+              hooks: [{ type: "command", command: "node ${CLAUDE_PLUGIN_ROOT}/hooks/pretooluse.mjs" }],
+            }],
+            SessionStart: [{
+              matcher: "",
+              hooks: [{ type: "command", command: "node ${CLAUDE_PLUGIN_ROOT}/hooks/sessionstart.mjs" }],
+            }],
+          },
+        }),
+      );
+
+      const results = adapter.validateHooks(pluginRoot);
+      const preToolUse = results.find((r) => r.check === "PreToolUse hook");
+      const sessionStart = results.find((r) => r.check === "SessionStart hook");
+      expect(preToolUse?.status).toBe("pass");
+      expect(sessionStart?.status).toBe("pass");
+    });
+
+    it("returns FAIL when hooks are in neither settings.json nor plugin hooks.json", () => {
+      writeFileSync(join(tempDir, "settings.json"), JSON.stringify({}));
+
+      const results = adapter.validateHooks(pluginRoot);
+      const preToolUse = results.find((r) => r.check === "PreToolUse hook");
+      const sessionStart = results.find((r) => r.check === "SessionStart hook");
+      expect(preToolUse?.status).toBe("fail");
+      expect(sessionStart?.status).toBe("fail");
+    });
+
+    it("returns PASS when hooks exist in settings.json (existing behavior)", () => {
+      writeFileSync(
+        join(tempDir, "settings.json"),
+        JSON.stringify({
+          hooks: {
+            PreToolUse: [{
+              matcher: "Bash",
+              hooks: [{ type: "command", command: "context-mode hook claude-code pretooluse" }],
+            }],
+            SessionStart: [{
+              matcher: "",
+              hooks: [{ type: "command", command: "context-mode hook claude-code sessionstart" }],
+            }],
+          },
+        }),
+      );
+
+      const results = adapter.validateHooks(pluginRoot);
+      const preToolUse = results.find((r) => r.check === "PreToolUse hook");
+      const sessionStart = results.find((r) => r.check === "SessionStart hook");
+      expect(preToolUse?.status).toBe("pass");
+      expect(sessionStart?.status).toBe("pass");
     });
   });
 

@@ -4,7 +4,7 @@ description: |
   Show how much context window context-mode saved this session.
   Displays token consumption, context savings ratio, and per-tool breakdown.
   Trigger: /context-mode:ctx-stats
-user_invocable: true
+user-invocable: true
 ---
 
 # Context Mode Stats

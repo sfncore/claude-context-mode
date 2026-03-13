@@ -263,10 +263,11 @@ export class OpenCodeAdapter implements HookAdapter {
   }
 
   readSettings(): Record<string, unknown> | null {
-    // Try opencode.json, then .opencode/opencode.json
+    // Try project-local paths first, then global config
     const paths = [
       resolve("opencode.json"),
       resolve(".opencode", "opencode.json"),
+      join(homedir(), ".config", "opencode", "opencode.json"),
     ];
     for (const configPath of paths) {
       try {
@@ -412,6 +413,7 @@ export class OpenCodeAdapter implements HookAdapter {
     const paths = [
       resolve("opencode.json"),
       resolve(".opencode", "opencode.json"),
+      join(homedir(), ".config", "opencode", "opencode.json"),
     ];
     for (const configPath of paths) {
       try {

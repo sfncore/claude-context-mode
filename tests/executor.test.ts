@@ -934,6 +934,127 @@ puts "has_emoji: #{FILE_CONTENT.include?('🔒')}"
     assert.ok(r.stdout.includes("这是中文内容"), "Shell should read Chinese: " + r.stdout);
   });
 
+  // --- execute_file: file_path alias ---
+
+  test.runIf(runtimes.python)("execute_file: Python exposes 'file_path' as alias for FILE_CONTENT_PATH", async () => {
+    const r = await executor.executeFile({
+      path: testFile,
+      language: "python",
+      code: `
+import json
+with open(file_path) as f:
+    data = json.load(f)
+print(f"Users via file_path: {len(data['users'])}")
+      `,
+    });
+    assert.equal(r.exitCode, 0, `stderr: ${r.stderr}`);
+    assert.ok(r.stdout.includes("Users via file_path: 3"), `Got: ${r.stdout}`);
+  });
+
+  test("execute_file: JS exposes 'file_path' as alias for FILE_CONTENT_PATH", async () => {
+    const r = await executor.executeFile({
+      path: testFile,
+      language: "javascript",
+      code: `console.log("file_path alias: " + file_path);`,
+    });
+    assert.equal(r.exitCode, 0, `stderr: ${r.stderr}`);
+    assert.ok(r.stdout.includes(testFile), `Got: ${r.stdout}`);
+  });
+
+  test("execute_file: TypeScript exposes 'file_path' as alias for FILE_CONTENT_PATH", async () => {
+    const r = await executor.executeFile({
+      path: testFile,
+      language: "typescript",
+      code: `console.log("file_path alias: " + file_path);`,
+    });
+    assert.equal(r.exitCode, 0, `stderr: ${r.stderr}`);
+    assert.ok(r.stdout.includes(testFile), `Got: ${r.stdout}`);
+  });
+
+  test("execute_file: Shell exposes 'file_path' as alias for FILE_CONTENT_PATH", async () => {
+    const r = await executor.executeFile({
+      path: testFile,
+      language: "shell",
+      code: 'echo "file_path alias: $file_path"',
+    });
+    assert.equal(r.exitCode, 0, `stderr: ${r.stderr}`);
+    assert.ok(r.stdout.includes(testFile), `Got: ${r.stdout}`);
+  });
+
+  test.runIf(runtimes.ruby)("execute_file: Ruby exposes 'file_path' as alias for FILE_CONTENT_PATH", async () => {
+    const r = await executor.executeFile({
+      path: testFile,
+      language: "ruby",
+      code: `
+require 'json'
+data = JSON.parse(File.read(file_path))
+puts "Users via file_path: #{data['users'].length}"
+      `,
+    });
+    assert.equal(r.exitCode, 0, `stderr: ${r.stderr}`);
+    assert.ok(r.stdout.includes("Users via file_path: 3"), `Got: ${r.stdout}`);
+  });
+
+  test.runIf(runtimes.go)("execute_file: Go exposes 'file_path' as alias for FILE_CONTENT_PATH", async () => {
+    const r = await executor.executeFile({
+      path: testFile,
+      language: "go",
+      code: `fmt.Println("file_path alias: " + file_path)`,
+    });
+    assert.equal(r.exitCode, 0, `stderr: ${r.stderr}`);
+    assert.ok(r.stdout.includes(testFile), `Got: ${r.stdout}`);
+  });
+
+  test.runIf(runtimes.rust)("execute_file: Rust exposes 'file_path' as alias for file_content_path", async () => {
+    const r = await executor.executeFile({
+      path: testFile,
+      language: "rust",
+      code: `println!("file_path alias: {}", file_path);`,
+    });
+    assert.equal(r.exitCode, 0, `stderr: ${r.stderr}`);
+    assert.ok(r.stdout.includes(testFile), `Got: ${r.stdout}`);
+  });
+
+  test.runIf(runtimes.php)("execute_file: PHP exposes '$file_path' as alias for $FILE_CONTENT_PATH", async () => {
+    const r = await executor.executeFile({
+      path: testFile,
+      language: "php",
+      code: `echo "file_path alias: " . $file_path . "\\n";`,
+    });
+    assert.equal(r.exitCode, 0, `stderr: ${r.stderr}`);
+    assert.ok(r.stdout.includes(testFile), `Got: ${r.stdout}`);
+  });
+
+  test.runIf(runtimes.perl)("execute_file: Perl exposes '$file_path' as alias for $FILE_CONTENT_PATH", async () => {
+    const r = await executor.executeFile({
+      path: testFile,
+      language: "perl",
+      code: `print "file_path alias: $file_path\\n";`,
+    });
+    assert.equal(r.exitCode, 0, `stderr: ${r.stderr}`);
+    assert.ok(r.stdout.includes(testFile), `Got: ${r.stdout}`);
+  });
+
+  test.runIf(runtimes.r)("execute_file: R exposes 'file_path' as alias for FILE_CONTENT_PATH", async () => {
+    const r = await executor.executeFile({
+      path: testFile,
+      language: "r",
+      code: `cat(paste0("file_path alias: ", file_path, "\\n"))`,
+    });
+    assert.equal(r.exitCode, 0, `stderr: ${r.stderr}`);
+    assert.ok(r.stdout.includes(testFile), `Got: ${r.stdout}`);
+  });
+
+  test.runIf(runtimes.elixir)("execute_file: Elixir exposes 'file_path' as alias for file_content_path", async () => {
+    const r = await executor.executeFile({
+      path: testFile,
+      language: "elixir",
+      code: `IO.puts("file_path alias: " <> file_path)`,
+    });
+    assert.equal(r.exitCode, 0, `stderr: ${r.stderr}`);
+    assert.ok(r.stdout.includes(testFile), `Got: ${r.stdout}`);
+  });
+
   afterAll(() => {
     rmSync(testDir, { recursive: true, force: true });
   });

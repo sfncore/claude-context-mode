@@ -4,7 +4,7 @@ description: |
   Update context-mode from GitHub and fix hooks/settings.
   Pulls latest, builds, installs, updates npm global, configures hooks.
   Trigger: /context-mode:ctx-upgrade
-user_invocable: true
+user-invocable: true
 ---
 
 # Context Mode Upgrade
